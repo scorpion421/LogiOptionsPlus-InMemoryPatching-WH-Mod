@@ -4,8 +4,6 @@
 [![Windhawk](https://img.shields.io/badge/Windhawk-mod-blue)](https://windhawk.net/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078D6?logo=windows&logoColor=white)](#compatibility)
 ![Architecture](https://img.shields.io/badge/arch-amd64-lightgrey)
-[![GitHub release](https://img.shields.io/github/v/release/scorpion421/LogiOptionsPlus-InMemoryPatching-WH-Mod?display_name=tag)](https://github.com/scorpion421/LogiOptionsPlus-InMemoryPatching-WH-Mod/releases)
-[![GitHub stars](https://img.shields.io/github/stars/scorpion421/LogiOptionsPlus-InMemoryPatching-WH-Mod?style=social)](https://github.com/scorpion421/LogiOptionsPlus-InMemoryPatching-WH-Mod/stargazers)
 
 A [Windhawk](https://windhawk.net/) mod that enables high-resolution smooth mouse wheel scrolling in **any** application, not just the handful of browsers that Logitech hardcodes.
 
