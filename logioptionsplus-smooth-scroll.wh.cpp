@@ -2,8 +2,9 @@
 // @id              logioptionsplus-smooth-scroll
 // @name            Logi Options+ Smooth Scroll for All Apps
 // @description     Enables high-resolution smooth mouse wheel scrolling in any application, not just browsers. Port of igvk/LogiOptionsPlus-InMemoryPatching.
-// @version         2.0.0
+// @version         2.0.1
 // @author          MickyFoley
+// @github          https://github.com/scorpion421
 // @include         logioptionsplus_agent.exe
 // @architecture    amd64
 // @license         MIT
@@ -57,6 +58,24 @@ calls back into the decision logic.
 - No `version.dll` deployment required. No reconfiguration after Logi Options+ updates.
 - Settings changes apply immediately without restarting the agent.
 - Original project: https://github.com/igvk/LogiOptionsPlus-InMemoryPatching by igvk (MIT License)
+
+## Changelog
+
+### 2.0.1
+
+- **Fix**: Taskbar remained visible when entering fullscreen video or browser-based
+  fullscreen games (e.g. YouTube fullscreen, browser games). The per-invocation
+  debug log call inside the foreground-process handler slowed the hook enough to
+  interfere with the window manager's fullscreen detection. The per-call log was
+  removed; match-outcome logs (when an entry from the additional/excluded list
+  actually matches) are unchanged.
+- **Metadata**: Added `@github` link to the mod header.
+
+### 2.0.0
+
+- Initial release. Full port of igvk/LogiOptionsPlus-InMemoryPatching to a
+  Windhawk mod, including the in-memory inline trampoline hook and the five
+  per-version assembly handlers.
 */
 // ==/WindhawkModReadme==
 
@@ -193,8 +212,11 @@ extern "C" bool patched_switch_foreground_process_handler(
     std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
-    Wh_Log(L"handler: name='%S' length=%zu previous_check=%d",
-           lower_name.c_str(), length, previous_check);
+    // No per-invocation logging here: this function is called on every
+    // foreground-window change and during video playback / fullscreen
+    // transitions. Logging every call slowed the handler enough to interfere
+    // with the window manager's fullscreen detection (taskbar remained
+    // visible). Only match outcomes are logged, below.
 
     // Strip any path component so patterns match just the filename.
     const auto sep = lower_name.rfind('\\');
