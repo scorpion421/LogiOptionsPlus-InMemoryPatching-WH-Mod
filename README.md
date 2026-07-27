@@ -4,6 +4,8 @@
 [![Windhawk](https://img.shields.io/badge/Windhawk-mod-blue)](https://windhawk.net/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078D6?logo=windows&logoColor=white)](#compatibility)
 ![Architecture](https://img.shields.io/badge/arch-amd64-lightgrey)
+[![GitHub release](https://img.shields.io/github/v/release/scorpion421/LogiOptionsPlus-InMemoryPatching-WH-Mod?display_name=tag)](https://github.com/scorpion421/LogiOptionsPlus-InMemoryPatching-WH-Mod/releases)
+[![GitHub stars](https://img.shields.io/github/stars/scorpion421/LogiOptionsPlus-InMemoryPatching-WH-Mod?style=social)](https://github.com/scorpion421/LogiOptionsPlus-InMemoryPatching-WH-Mod/stargazers)
 
 A [Windhawk](https://windhawk.net/) mod that enables high-resolution smooth mouse wheel scrolling in **any** application, not just the handful of browsers that Logitech hardcodes.
 
@@ -76,9 +78,16 @@ If smooth scrolling does not work after enabling the mod, check the Windhawk log
 
 - which signature was matched and at what address,
 - how many enabled/disabled entries were loaded from settings,
-- each time the foreground-check handler fires, with the process name it saw.
+- each time an application matches an entry from either list, with the pattern
+  that matched.
 
-If you see `no matching signature found`, the installed agent version is not covered by the current signatures. If the handler never fires, the hook did not take. If settings show `0 enabled`, the application list did not load -- verify the entries in the Windhawk settings UI.
+The handler deliberately does not log on every foreground change. It runs on a
+path the window manager is timing, and logging there is expensive enough to
+interfere with fullscreen transitions.
+
+If you see `no matching signature found`, the installed agent version is not covered by the current signatures. If settings show `0 enabled`, the application list did not load -- verify the entries in the Windhawk settings UI.
+
+Note that not every fullscreen or taskbar oddity is caused by this mod. Firefox had a Gecko bug where the Windows taskbar stayed visible when a tab went fullscreen while a Picture-in-Picture window was open ([bug 2048501](https://bugzilla.mozilla.org/show_bug.cgi?id=2048501)), reproducible on a clean profile with no add-ons. Rule out the browser before suspecting the mod.
 
 ## Credits
 
