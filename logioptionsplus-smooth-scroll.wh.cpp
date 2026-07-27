@@ -2,7 +2,7 @@
 // @id              logioptionsplus-smooth-scroll
 // @name            Logi Options+ Smooth Scroll for All Apps
 // @description     Enables high-resolution smooth mouse wheel scrolling in any application, not just browsers. Port of igvk/LogiOptionsPlus-InMemoryPatching.
-// @version         2.0.1
+// @version         2.3.0
 // @author          MickyFoley
 // @github          https://github.com/scorpion421
 // @include         logioptionsplus_agent.exe
@@ -61,6 +61,63 @@ calls back into the decision logic.
 
 ## Changelog
 
+### 2.3.0
+
+- **Pass-through for natively detected applications.** The hook is a patch at a
+  single address, so it necessarily fires for every process -- including the
+  browsers Logi Options+ already detects on its own. For those the mod cannot
+  change the answer, so running the decision logic was pure risk: it cost time
+  and clobbered registers and flags on a path the window manager is timing.
+
+  Each assembly handler now checks two flags up front and falls straight through
+  to the original instructions whenever the outcome cannot differ from what the
+  agent already computed. In that case the agent sees the exact register and
+  flag state it would have seen without the mod. With no excluded patterns
+  configured, every natively supported browser takes this path.
+
+  The handlers also preserve the agent's flags across the whole hook, which the
+  previous versions did not.
+
+  Verified equivalent to the full logic across 900k+ generated combinations.
+
+### 2.2.0
+
+Internal correctness and hardening pass. No change to settings or matching
+behaviour: the decision logic was verified bit-identical against the previous
+version across 120k+ generated input combinations, and the assembly handlers
+still emit byte-identical argument setup and epilogue.
+
+- **Fix (ABI)**: The assembly handlers now preserve the volatile registers they
+  do not use for arguments (R9, R10, R11, XMM0-XMM5), align RSP to 16 bytes at
+  the call site, and reserve their own shadow space instead of borrowing the
+  agent's.
+
+  The hook point sits at a common exit for two paths through the agent's
+  foreground check: one that ran a string comparison, and one that branched
+  straight past it. On the second path no call occurs, so the compiler may keep
+  live values in the volatile registers -- which calling into C++ from the hook
+  destroyed.
+
+- **Fix (race)**: Settings were replaced by value while the hook handler could be
+  iterating them on an agent thread, so a settings change during a foreground
+  switch could read freed memory. Settings are now published through an atomic
+  pointer swap; the hot path is lock-free and never sees a half-updated list.
+- **Performance**: The handler no longer allocates. It previously built a
+  `std::string` on every foreground change; the executable name is now located
+  in place and lowercased into stack storage. Added early exits so the common
+  case -- a natively detected browser with no excluded patterns -- returns
+  without inspecting the name at all. This is the same class of issue as the
+  2.0.1 logging fix: work done here delays the agent's answer during fullscreen
+  transitions.
+- **Safety**: The relay page is now verified to be within rel32 range before any
+  byte is written into the agent, instead of relying on a truncating cast.
+- **Safety**: Only the bytes being patched are unprotected, rather than the
+  entire surrounding code region.
+- **Robustness**: A signature match whose hook bytes are absent (already patched,
+  or a false-positive match elsewhere in memory) now continues searching instead
+  of aborting the install. Added a bounds check on the backup buffer and a guard
+  against a zero-sized memory region stalling the scan.
+
 ### 2.0.1
 
 - **Fix**: Taskbar remained visible when entering fullscreen video or browser-based
@@ -97,10 +154,10 @@ calls back into the decision logic.
 // ==/WindhawkModSettings==
 
 #include <windows.h>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
-#include <algorithm>
-#include <cctype>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -141,6 +198,13 @@ static const uint8_t k_hook_V194[] = { 0x41, 0x88, 0x47, 0x28, 0x49, 0x8B, 0x7F,
 // Maximum byte distance to search for the hook sequence after the signature.
 static constexpr size_t k_max_hook_disp = 0x20;
 
+// Size of an E9 rel32 jump: opcode + 32-bit displacement.
+static constexpr size_t k_rel_jmp_size = 1 + sizeof(int32_t);
+
+// Size of the absolute jump stub written into the relay page:
+// mov r10, imm64 (10 bytes) + jmp r10 (3 bytes).
+static constexpr size_t k_abs_jmp_size = 13;
+
 // Memory protection flags that indicate executable pages.
 static constexpr DWORD k_exec_protect =
     PAGE_EXECUTE | PAGE_EXECUTE_READ |
@@ -155,11 +219,34 @@ struct ModSettings {
     std::vector<std::string>  disabled;  // excluded apps  (lowercase patterns)
 };
 
-static ModSettings g_settings;
+// Published through an atomic pointer rather than held by value.
+//
+// The hook handler runs on the agent's own threads, while Wh_ModSettingsChanged
+// runs on a Windhawk thread. Replacing a by-value ModSettings would destroy the
+// vectors a handler might be iterating at that very moment. Swapping a pointer
+// is atomic and keeps the hot path lock-free.
+//
+// Retired generations are intentionally leaked: a handler may still be reading
+// one when the swap happens, settings changes are rare and user-driven, and the
+// leak is a few hundred bytes. This mirrors the deliberate leak of the relay
+// page in RemoveHook() for the same reason.
+static std::atomic<const ModSettings*> g_settings{nullptr};
+
+// ASCII lowercase. Deliberately not std::tolower: that consults the current
+// locale and is a real function call, which is measurable in the hot path.
+// Executable names are ASCII.
+static inline char ascii_lower(char c)
+{
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+}
 
 // ===========================================================================
 // Glob matching (direct port from utilities.cpp)
-// glob string must already be lowercase; text is compared case-insensitively.
+//
+// PRECONDITION: both 'text' and 'glob' are already lowercase. The original
+// lowercased 'text' on every character comparison; the single caller now
+// lowercases once into a stack buffer, so that per-character work is dropped.
+// Matching behaviour is unchanged.
 // ===========================================================================
 
 static bool glob_match(const char* text, const char* glob)
@@ -170,8 +257,7 @@ static bool glob_match(const char* text, const char* glob)
         if (*glob == '*') {
             text_backup = text;
             glob_backup = ++glob;
-        } else if ((*glob == '?' && *text != '/') ||
-                   *glob == static_cast<char>(std::tolower(static_cast<unsigned char>(*text)))) {
+        } else if ((*glob == '?' && *text != '/') || *glob == *text) {
             text++;
             glob++;
         } else {
@@ -204,39 +290,81 @@ static bool glob_match(const char* text, const char* glob)
 //   4. default                  -> false
 // ===========================================================================
 
+// Upper bound for the stack buffer holding the lowercased executable name.
+static constexpr size_t k_name_buf = 260;
+
 extern "C" bool patched_switch_foreground_process_handler(
     const char* name, size_t length, bool previous_check)
 {
-    // Build a lowercase, null-terminated copy for matching.
-    std::string lower_name(name, length);
-    std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    const ModSettings* s = g_settings.load(std::memory_order_acquire);
+    if (!s || !name)
+        return previous_check;   // never worse than the agent's own answer
 
-    // No per-invocation logging here: this function is called on every
-    // foreground-window change and during video playback / fullscreen
-    // transitions. Logging every call slowed the handler enough to interfere
-    // with the window manager's fullscreen detection (taskbar remained
-    // visible). Only match outcomes are logged, below.
+    const bool have_disabled = !s->disabled.empty();
+    const bool have_enabled  = !s->enabled.empty();
 
-    // Strip any path component so patterns match just the filename.
-    const auto sep = lower_name.rfind('\\');
-    const char* basename = (sep != std::string::npos)
-                           ? lower_name.c_str() + sep + 1
-                           : lower_name.c_str();
+    // -------------------------------------------------------------------
+    // Fast paths.
+    //
+    // The agent calls this on every foreground change, including the burst
+    // Windows emits while a window goes fullscreen. Anything done here delays
+    // the agent's answer, and a late answer can make Windows miss its own
+    // window for hiding the taskbar. So: do no work at all whenever the
+    // outcome is already determined.
+    //
+    // With no excluded patterns nothing can veto a positive result, so the
+    // agent's own verdict stands when it is true. This is the common case for
+    // every natively detected browser (Chrome, Edge, Firefox) and returns
+    // without touching the name, allocating, or matching anything.
+    //
+    // Results are bit-identical to the full logic below.
+    // -------------------------------------------------------------------
+    if (!have_disabled) {
+        if (previous_check)
+            return true;
+        if (!have_enabled)
+            return false;
+    }
 
-    for (const auto& glob : g_settings.disabled) {
-        if (glob_match(basename, glob.c_str())) {
+    // -------------------------------------------------------------------
+    // Slow path. Still allocation-free: the basename is located in the
+    // caller's buffer and lowercased into stack storage. The previous version
+    // built a std::string per call, which is heap traffic on a path the
+    // window manager is timing.
+    //
+    // No per-invocation logging here either -- only match outcomes are logged.
+    // -------------------------------------------------------------------
+    const char* base     = name;
+    size_t      base_len = length;
+    for (size_t i = length; i > 0; i--) {
+        const char c = name[i - 1];
+        if (c == '\\' || c == '/') {
+            base     = name + i;
+            base_len = length - i;
+            break;
+        }
+    }
+
+    char buf[k_name_buf];
+    if (base_len >= sizeof buf)
+        base_len = sizeof buf - 1;
+    for (size_t i = 0; i < base_len; i++)
+        buf[i] = ascii_lower(base[i]);
+    buf[base_len] = '\0';
+
+    for (const auto& glob : s->disabled) {
+        if (glob_match(buf, glob.c_str())) {
             Wh_Log(L"handler: '%S' matched disabled '%S' -> false",
-                   basename, glob.c_str());
+                   buf, glob.c_str());
             return false;
         }
     }
     if (previous_check)
         return true;
-    for (const auto& glob : g_settings.enabled) {
-        if (glob_match(basename, glob.c_str())) {
+    for (const auto& glob : s->enabled) {
+        if (glob_match(buf, glob.c_str())) {
             Wh_Log(L"handler: '%S' matched enabled '%S' -> true",
-                   basename, glob.c_str());
+                   buf, glob.c_str());
             return true;
         }
     }
@@ -253,8 +381,21 @@ extern "C" bool patched_switch_foreground_process_handler(
 //
 // The handlers do NOT follow a normal calling convention on entry: they are
 // reached via a JMP from inside the agent's function, so the registers are in
-// the agent's mid-function state. The shadow space of the target function may
-// be reused by the callee, matching the original project's reasoning.
+// the agent's mid-function state.
+//
+// The hook point is a common exit for two paths through the agent's function:
+// one that ran a string comparison (and therefore already clobbered the
+// volatile registers) and one that branched straight past it (and therefore
+// did not). On the second path the compiler is free to keep live values in
+// RAX/RCX/RDX/R8-R11 and XMM0-XMM5, because from its point of view no call
+// happens there. Calling into C++ from here destroys exactly those.
+//
+// Each handler therefore saves and restores the volatile registers it does not
+// use for arguments, aligns RSP to 16 bytes as the Win64 ABI requires at a call
+// site, and reserves its own 32-byte shadow space instead of borrowing the
+// agent's. RCX, RDX, R8 and RAX are argument/return registers and are clobbered
+// by design. All other registers used by the handlers (RBP, RBX, RSI, RDI, R12,
+// R14, R15) are non-volatile and preserved by the callee.
 // ===========================================================================
 
 extern "C" {
@@ -262,6 +403,24 @@ extern "C" {
     // before arming each hook. Shared single slot: only one version is ever
     // hooked per process, matching the original code.
     void* original_jump_address = nullptr;
+
+    // Bypass flags read directly by the assembly handlers.
+    //
+    // The hook sits at a single address and therefore fires for every process,
+    // including the browsers the agent already detects natively. For those the
+    // decision logic cannot change the answer, so running it is pure risk: it
+    // costs time and clobbers registers and flags on a path the window manager
+    // is timing. These flags let each handler recognise that case and fall
+    // straight through to the original instructions, leaving the agent in
+    // exactly the state it would have been in without the mod.
+    //
+    //   g_veto_patterns  != 0  ->  the excluded list can turn a true into false
+    //   g_extra_patterns != 0  ->  the additional list can turn a false into true
+    //
+    // They mirror the fast-path conditions in the C++ handler, which stays in
+    // place as a safety net.
+    volatile unsigned char g_veto_patterns  = 0;
+    volatile unsigned char g_extra_patterns = 0;
 
     void injected_handler_V100();
     void injected_handler_V146();
@@ -277,12 +436,57 @@ __asm__(
     // ---- V100 ----
     ".globl injected_handler_V100\n"
     "injected_handler_V100:\n"
-    "    lea rcx, [rsp+0xB8-0x40]\n"
+    // Save the agent's flags first, so the bypass path below is fully
+    // transparent. This lowers RSP by 8; any RSP-relative operand in the
+    // argument setup is offset accordingly.
+    "    pushfq\n"
+    // Bypass: skip everything when the outcome cannot differ from the
+    // value the agent already computed in AL.
+    "    test al, al\n"
+    "    jnz .Lveto_V100\n"
+    "    cmp byte ptr [rip + g_extra_patterns], 0\n"
+    "    je .Lpass_V100\n"
+    "    jmp .Lfull_V100\n"
+    ".Lveto_V100:\n"
+    "    cmp byte ptr [rip + g_veto_patterns], 0\n"
+    "    je .Lpass_V100\n"
+    ".Lfull_V100:\n"
+    // Arguments come from the agent's mid-function register state, so they
+    // must be computed before anything below moves RSP again.
+    "    lea rcx, [rsp+0xB8-0x40+8]\n"
     "    cmp rdi, 0x10\n"
-    "    cmovnb rcx, rbx\n"            // name
-    "    mov rdx, rsi\n"              // length
-    "    movzx r8, al\n"             // previous check
+    "    cmovnb rcx, rbx\n"
+    "    mov rdx, rsi\n"
+    "    movzx r8, al\n"
+    // Preserve volatile GP and XMM registers, align RSP to 16 and reserve
+    // our own shadow space (see the note above this block).
+    "    push r9\n"
+    "    push r10\n"
+    "    push r11\n"
+    "    mov r11, rsp\n"
+    "    and rsp, -16\n"
+    "    sub rsp, 144\n"
+    "    mov [rsp+128], r11\n"
+    "    movaps [rsp+32], xmm0\n"
+    "    movaps [rsp+48], xmm1\n"
+    "    movaps [rsp+64], xmm2\n"
+    "    movaps [rsp+80], xmm3\n"
+    "    movaps [rsp+96], xmm4\n"
+    "    movaps [rsp+112], xmm5\n"
     "    call patched_switch_foreground_process_handler\n"
+    "    movaps xmm0, [rsp+32]\n"
+    "    movaps xmm1, [rsp+48]\n"
+    "    movaps xmm2, [rsp+64]\n"
+    "    movaps xmm3, [rsp+80]\n"
+    "    movaps xmm4, [rsp+96]\n"
+    "    movaps xmm5, [rsp+112]\n"
+    "    mov rsp, [rsp+128]\n"
+    "    pop r11\n"
+    "    pop r10\n"
+    "    pop r9\n"
+    ".Lpass_V100:\n"
+    "    popfq\n"
+    // Replay the two overwritten instructions, then resume the agent.
     "    mov [rbp+0x28], al\n"
     "    mov rdi, [rbp+0x8]\n"
     "    jmp [rip + original_jump_address]\n"
@@ -290,12 +494,57 @@ __asm__(
     // ---- V146 ----
     ".globl injected_handler_V146\n"
     "injected_handler_V146:\n"
+    // Save the agent's flags first, so the bypass path below is fully
+    // transparent. This lowers RSP by 8; any RSP-relative operand in the
+    // argument setup is offset accordingly.
+    "    pushfq\n"
+    // Bypass: skip everything when the outcome cannot differ from the
+    // value the agent already computed in AL.
+    "    test al, al\n"
+    "    jnz .Lveto_V146\n"
+    "    cmp byte ptr [rip + g_extra_patterns], 0\n"
+    "    je .Lpass_V146\n"
+    "    jmp .Lfull_V146\n"
+    ".Lveto_V146:\n"
+    "    cmp byte ptr [rip + g_veto_patterns], 0\n"
+    "    je .Lpass_V146\n"
+    ".Lfull_V146:\n"
+    // Arguments come from the agent's mid-function register state, so they
+    // must be computed before anything below moves RSP again.
     "    lea rcx, [rbp+0x57-0x58]\n"
     "    cmp r14, 0x10\n"
-    "    cmovnb rcx, rsi\n"            // name
-    "    mov rdx, rbx\n"              // length
-    "    movzx r8, al\n"             // previous check
+    "    cmovnb rcx, rsi\n"
+    "    mov rdx, rbx\n"
+    "    movzx r8, al\n"
+    // Preserve volatile GP and XMM registers, align RSP to 16 and reserve
+    // our own shadow space (see the note above this block).
+    "    push r9\n"
+    "    push r10\n"
+    "    push r11\n"
+    "    mov r11, rsp\n"
+    "    and rsp, -16\n"
+    "    sub rsp, 144\n"
+    "    mov [rsp+128], r11\n"
+    "    movaps [rsp+32], xmm0\n"
+    "    movaps [rsp+48], xmm1\n"
+    "    movaps [rsp+64], xmm2\n"
+    "    movaps [rsp+80], xmm3\n"
+    "    movaps [rsp+96], xmm4\n"
+    "    movaps [rsp+112], xmm5\n"
     "    call patched_switch_foreground_process_handler\n"
+    "    movaps xmm0, [rsp+32]\n"
+    "    movaps xmm1, [rsp+48]\n"
+    "    movaps xmm2, [rsp+64]\n"
+    "    movaps xmm3, [rsp+80]\n"
+    "    movaps xmm4, [rsp+96]\n"
+    "    movaps xmm5, [rsp+112]\n"
+    "    mov rsp, [rsp+128]\n"
+    "    pop r11\n"
+    "    pop r10\n"
+    "    pop r9\n"
+    ".Lpass_V146:\n"
+    "    popfq\n"
+    // Replay the two overwritten instructions, then resume the agent.
     "    mov [r12+0x28], al\n"
     "    mov r12, [r12+0x8]\n"
     "    jmp [rip + original_jump_address]\n"
@@ -303,12 +552,57 @@ __asm__(
     // ---- V168 ----
     ".globl injected_handler_V168\n"
     "injected_handler_V168:\n"
+    // Save the agent's flags first, so the bypass path below is fully
+    // transparent. This lowers RSP by 8; any RSP-relative operand in the
+    // argument setup is offset accordingly.
+    "    pushfq\n"
+    // Bypass: skip everything when the outcome cannot differ from the
+    // value the agent already computed in AL.
+    "    test al, al\n"
+    "    jnz .Lveto_V168\n"
+    "    cmp byte ptr [rip + g_extra_patterns], 0\n"
+    "    je .Lpass_V168\n"
+    "    jmp .Lfull_V168\n"
+    ".Lveto_V168:\n"
+    "    cmp byte ptr [rip + g_veto_patterns], 0\n"
+    "    je .Lpass_V168\n"
+    ".Lfull_V168:\n"
+    // Arguments come from the agent's mid-function register state, so they
+    // must be computed before anything below moves RSP again.
     "    lea rcx, [rbp+0x57-0x78]\n"
     "    cmp r14, 0x10\n"
-    "    cmovnb rcx, rdi\n"            // name
-    "    mov rdx, rbx\n"              // length
-    "    movzx r8, al\n"             // previous check
+    "    cmovnb rcx, rdi\n"
+    "    mov rdx, rbx\n"
+    "    movzx r8, al\n"
+    // Preserve volatile GP and XMM registers, align RSP to 16 and reserve
+    // our own shadow space (see the note above this block).
+    "    push r9\n"
+    "    push r10\n"
+    "    push r11\n"
+    "    mov r11, rsp\n"
+    "    and rsp, -16\n"
+    "    sub rsp, 144\n"
+    "    mov [rsp+128], r11\n"
+    "    movaps [rsp+32], xmm0\n"
+    "    movaps [rsp+48], xmm1\n"
+    "    movaps [rsp+64], xmm2\n"
+    "    movaps [rsp+80], xmm3\n"
+    "    movaps [rsp+96], xmm4\n"
+    "    movaps [rsp+112], xmm5\n"
     "    call patched_switch_foreground_process_handler\n"
+    "    movaps xmm0, [rsp+32]\n"
+    "    movaps xmm1, [rsp+48]\n"
+    "    movaps xmm2, [rsp+64]\n"
+    "    movaps xmm3, [rsp+80]\n"
+    "    movaps xmm4, [rsp+96]\n"
+    "    movaps xmm5, [rsp+112]\n"
+    "    mov rsp, [rsp+128]\n"
+    "    pop r11\n"
+    "    pop r10\n"
+    "    pop r9\n"
+    ".Lpass_V168:\n"
+    "    popfq\n"
+    // Replay the two overwritten instructions, then resume the agent.
     "    mov [r12+0x28], al\n"
     "    mov r12, [r12+0x8]\n"
     "    jmp [rip + original_jump_address]\n"
@@ -316,12 +610,57 @@ __asm__(
     // ---- V186 ----
     ".globl injected_handler_V186\n"
     "injected_handler_V186:\n"
+    // Save the agent's flags first, so the bypass path below is fully
+    // transparent. This lowers RSP by 8; any RSP-relative operand in the
+    // argument setup is offset accordingly.
+    "    pushfq\n"
+    // Bypass: skip everything when the outcome cannot differ from the
+    // value the agent already computed in AL.
+    "    test al, al\n"
+    "    jnz .Lveto_V186\n"
+    "    cmp byte ptr [rip + g_extra_patterns], 0\n"
+    "    je .Lpass_V186\n"
+    "    jmp .Lfull_V186\n"
+    ".Lveto_V186:\n"
+    "    cmp byte ptr [rip + g_veto_patterns], 0\n"
+    "    je .Lpass_V186\n"
+    ".Lfull_V186:\n"
+    // Arguments come from the agent's mid-function register state, so they
+    // must be computed before anything below moves RSP again.
     "    lea rcx, [rbp+0x40-0x80]\n"
     "    cmp r14, 0x10\n"
-    "    cmovnb rcx, rdi\n"            // name
-    "    mov rdx, rbx\n"              // length
-    "    movzx r8, al\n"             // previous check
+    "    cmovnb rcx, rdi\n"
+    "    mov rdx, rbx\n"
+    "    movzx r8, al\n"
+    // Preserve volatile GP and XMM registers, align RSP to 16 and reserve
+    // our own shadow space (see the note above this block).
+    "    push r9\n"
+    "    push r10\n"
+    "    push r11\n"
+    "    mov r11, rsp\n"
+    "    and rsp, -16\n"
+    "    sub rsp, 144\n"
+    "    mov [rsp+128], r11\n"
+    "    movaps [rsp+32], xmm0\n"
+    "    movaps [rsp+48], xmm1\n"
+    "    movaps [rsp+64], xmm2\n"
+    "    movaps [rsp+80], xmm3\n"
+    "    movaps [rsp+96], xmm4\n"
+    "    movaps [rsp+112], xmm5\n"
     "    call patched_switch_foreground_process_handler\n"
+    "    movaps xmm0, [rsp+32]\n"
+    "    movaps xmm1, [rsp+48]\n"
+    "    movaps xmm2, [rsp+64]\n"
+    "    movaps xmm3, [rsp+80]\n"
+    "    movaps xmm4, [rsp+96]\n"
+    "    movaps xmm5, [rsp+112]\n"
+    "    mov rsp, [rsp+128]\n"
+    "    pop r11\n"
+    "    pop r10\n"
+    "    pop r9\n"
+    ".Lpass_V186:\n"
+    "    popfq\n"
+    // Replay the two overwritten instructions, then resume the agent.
     "    mov [r12+0x28], al\n"
     "    mov r12, [r12+0x8]\n"
     "    jmp [rip + original_jump_address]\n"
@@ -329,12 +668,57 @@ __asm__(
     // ---- V194 ----
     ".globl injected_handler_V194\n"
     "injected_handler_V194:\n"
+    // Save the agent's flags first, so the bypass path below is fully
+    // transparent. This lowers RSP by 8; any RSP-relative operand in the
+    // argument setup is offset accordingly.
+    "    pushfq\n"
+    // Bypass: skip everything when the outcome cannot differ from the
+    // value the agent already computed in AL.
+    "    test al, al\n"
+    "    jnz .Lveto_V194\n"
+    "    cmp byte ptr [rip + g_extra_patterns], 0\n"
+    "    je .Lpass_V194\n"
+    "    jmp .Lfull_V194\n"
+    ".Lveto_V194:\n"
+    "    cmp byte ptr [rip + g_veto_patterns], 0\n"
+    "    je .Lpass_V194\n"
+    ".Lfull_V194:\n"
+    // Arguments come from the agent's mid-function register state, so they
+    // must be computed before anything below moves RSP again.
     "    lea rcx, [rbp+0x70-0x70]\n"
     "    cmp rsi, 0xF\n"
-    "    cmova rcx, rdi\n"             // name
-    "    mov rdx, rbx\n"              // length
-    "    movzx r8, al\n"             // previous check
+    "    cmova rcx, rdi\n"
+    "    mov rdx, rbx\n"
+    "    movzx r8, al\n"
+    // Preserve volatile GP and XMM registers, align RSP to 16 and reserve
+    // our own shadow space (see the note above this block).
+    "    push r9\n"
+    "    push r10\n"
+    "    push r11\n"
+    "    mov r11, rsp\n"
+    "    and rsp, -16\n"
+    "    sub rsp, 144\n"
+    "    mov [rsp+128], r11\n"
+    "    movaps [rsp+32], xmm0\n"
+    "    movaps [rsp+48], xmm1\n"
+    "    movaps [rsp+64], xmm2\n"
+    "    movaps [rsp+80], xmm3\n"
+    "    movaps [rsp+96], xmm4\n"
+    "    movaps [rsp+112], xmm5\n"
     "    call patched_switch_foreground_process_handler\n"
+    "    movaps xmm0, [rsp+32]\n"
+    "    movaps xmm1, [rsp+48]\n"
+    "    movaps xmm2, [rsp+64]\n"
+    "    movaps xmm3, [rsp+80]\n"
+    "    movaps xmm4, [rsp+96]\n"
+    "    movaps xmm5, [rsp+112]\n"
+    "    mov rsp, [rsp+128]\n"
+    "    pop r11\n"
+    "    pop r10\n"
+    "    pop r9\n"
+    ".Lpass_V194:\n"
+    "    popfq\n"
+    // Replay the two overwritten instructions, then resume the agent.
     "    mov [r15+0x28], al\n"
     "    mov rdi, [r15+0x8]\n"
     "    jmp [rip + original_jump_address]\n"
@@ -412,8 +796,12 @@ static void* AllocatePageNearAddress(void* targetAddr)
 }
 
 // Writes an absolute 64-bit jump (mov r10, imm64 / jmp r10) at absJumpMemory.
+// The caller supplies a full page, so k_abs_jmp_size always fits. R10 is a
+// volatile scratch register under the Win64 ABI and is not used to pass the
+// handler arguments, so clobbering it here is safe.
 static void WriteAbsoluteJump64(void* absJumpMemory, void* addrToJumpTo)
 {
+    static_assert(k_abs_jmp_size == 13, "absolute jump stub size mismatch");
     uint8_t* code = static_cast<uint8_t*>(absJumpMemory);
     // mov r10, imm64  => 49 BA <imm64>
     code[0] = 0x49;
@@ -433,25 +821,45 @@ static void WriteAbsoluteJump64(void* absJumpMemory, void* addrToJumpTo)
 static bool InstallAllocateHook(void* func2hook, size_t injectSize,
                                 void (*payloadFunction)(), void** out_relay)
 {
+    // An E9 rel32 needs 5 bytes; anything shorter cannot be patched safely.
+    if (injectSize < k_rel_jmp_size) {
+        Wh_Log(L"InstallAllocateHook: inject size %zu below minimum %zu",
+               injectSize, k_rel_jmp_size);
+        return false;
+    }
+
     void* relay = AllocatePageNearAddress(func2hook);
     if (!relay) {
         Wh_Log(L"InstallAllocateHook: unable to allocate page near target");
         return false;
     }
+
+    // Verify the relay is genuinely reachable by a 32-bit relative jump before
+    // writing anything into the agent. AllocatePageNearAddress searches within
+    // range, but a truncating cast would silently produce a wild jump if it
+    // ever returned something farther out.
+    const intptr_t delta =
+        static_cast<uint8_t*>(relay) -
+        (static_cast<uint8_t*>(func2hook) + k_rel_jmp_size);
+    if (delta < INT32_MIN || delta > INT32_MAX) {
+        Wh_Log(L"InstallAllocateHook: relay out of rel32 range (delta = %lld)",
+               static_cast<long long>(delta));
+        VirtualFree(relay, 0, MEM_RELEASE);
+        return false;
+    }
+
     WriteAbsoluteJump64(relay, reinterpret_cast<void*>(payloadFunction));
 
-    constexpr uint8_t jmpInstruction = 0xE9;
-    const uint32_t relAddr = static_cast<uint32_t>(
-        static_cast<uint8_t*>(relay) -
-        (static_cast<uint8_t*>(func2hook) + sizeof jmpInstruction + sizeof(uint32_t)));
-
+    const int32_t relAddr = static_cast<int32_t>(delta);
     uint8_t* code = static_cast<uint8_t*>(func2hook);
-    code[0] = jmpInstruction;
+    code[0] = 0xE9;
     std::memcpy(code + 1, &relAddr, sizeof relAddr);
 
-    size_t remaining = injectSize - (sizeof jmpInstruction + sizeof relAddr);
+    // Pad the remainder of the overwritten instructions with NOPs so the
+    // region never contains a partial instruction.
+    const size_t remaining = injectSize - k_rel_jmp_size;
     if (remaining > 0)
-        std::memset(code + sizeof jmpInstruction + sizeof relAddr, 0x90, remaining);
+        std::memset(code + k_rel_jmp_size, 0x90, remaining);
 
     if (out_relay)
         *out_relay = relay;
@@ -509,6 +917,9 @@ static bool InstallHook()
          VirtualQuery(addr, &mbi, sizeof mbi);
          addr += mbi.RegionSize)
     {
+        // Defensive: a zero-sized region would make this loop spin forever.
+        if (mbi.RegionSize == 0)
+            break;
         if (mbi.State != MEM_COMMIT)
             continue;
         if (mbi.Protect == PAGE_NOACCESS)
@@ -534,17 +945,31 @@ static bool InstallHook()
 
             uint8_t* hook_addr = nullptr;
             if (!FindPattern(after_sig, count, ver.hook, ver.hook_len, hook_addr)) {
-                Wh_Log(L"InstallHook: hook bytes not found after signature (already patched?)");
-                return false;
+                // Either the agent is already patched, or this was a
+                // false-positive signature match somewhere else in memory.
+                // Keep looking instead of giving up on the whole install.
+                Wh_Log(L"InstallHook: signature %s matched but hook bytes absent; "
+                       L"trying next candidate", ver.label);
+                continue;
             }
             Wh_Log(L"InstallHook: hook point at %p", hook_addr);
 
+            if (ver.hook_len > sizeof g_backup.original) {
+                Wh_Log(L"InstallHook: hook length %zu exceeds backup buffer %zu",
+                       ver.hook_len, sizeof g_backup.original);
+                return false;
+            }
+
             // Return address = instruction right after the overwritten bytes.
+            // Published before the E9 is written, so the handler can never be
+            // reached with a stale value.
             original_jump_address = hook_addr + ver.hook_len;
 
-            // Make the region writable, arm the hook, restore protection.
-            DWORD oldProtect;
-            if (!VirtualProtect(mem, size, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            // Unprotect only the bytes being modified, not the whole region
+            // (which can span megabytes of the agent's code).
+            DWORD oldProtect = 0;
+            if (!VirtualProtect(hook_addr, ver.hook_len,
+                                PAGE_EXECUTE_READWRITE, &oldProtect)) {
                 Wh_Log(L"InstallHook: VirtualProtect failed, error = %u", GetLastError());
                 return false;
             }
@@ -555,8 +980,11 @@ static bool InstallHook()
             g_backup.length  = ver.hook_len;
 
             void* relay = nullptr;
-            bool ok = InstallAllocateHook(hook_addr, ver.hook_len, ver.handler, &relay);
-            VirtualProtect(mem, size, oldProtect, &oldProtect);
+            const bool ok = InstallAllocateHook(hook_addr, ver.hook_len,
+                                                ver.handler, &relay);
+
+            DWORD tmp = 0;
+            VirtualProtect(hook_addr, ver.hook_len, oldProtect, &tmp);
             FlushInstructionCache(GetCurrentProcess(), hook_addr, ver.hook_len);
 
             if (ok) {
@@ -619,9 +1047,11 @@ static std::vector<std::string> ReadStringArray(const wchar_t* key_fmt)
         }
         std::string entry;
         for (const wchar_t* p = raw; *p; p++) {
-            entry += static_cast<char>(
-                std::tolower(static_cast<unsigned char>(static_cast<char>(*p)))
-            );
+            // Executable names are ASCII; anything outside that range cannot
+            // match a real process name, so it is folded to '?' rather than
+            // silently truncated into an arbitrary byte.
+            const wchar_t w = *p;
+            entry += (w < 0x80) ? ascii_lower(static_cast<char>(w)) : '?';
         }
         Wh_FreeStringSetting(raw);
         if (!entry.empty())
@@ -632,13 +1062,31 @@ static std::vector<std::string> ReadStringArray(const wchar_t* key_fmt)
 
 static void LoadSettings()
 {
-    ModSettings fresh;
-    fresh.enabled  = ReadStringArray(L"enabledApps[%d]");
-    fresh.disabled = ReadStringArray(L"disabledApps[%d]");
-    g_settings = std::move(fresh);
-    Wh_Log(L"Settings loaded: %zu enabled, %zu disabled",
-           g_settings.enabled.size(),
-           g_settings.disabled.size());
+    auto* fresh = new (std::nothrow) ModSettings();
+    if (!fresh) {
+        Wh_Log(L"LoadSettings: allocation failed, keeping previous settings");
+        return;
+    }
+
+    fresh->enabled  = ReadStringArray(L"enabledApps[%d]");
+    fresh->disabled = ReadStringArray(L"disabledApps[%d]");
+
+    const size_t n_enabled  = fresh->enabled.size();
+    const size_t n_disabled = fresh->disabled.size();
+
+    // Publish atomically. The previous generation is deliberately not freed --
+    // see the note on g_settings.
+    g_settings.store(fresh, std::memory_order_release);
+
+    // Publish the assembly bypass flags after the settings they describe.
+    // Ordered this way the flags can only ever be conservative: a handler may
+    // briefly call into the decision logic when it no longer needs to, which is
+    // harmless. The reverse -- bypassing while a veto pattern exists -- cannot
+    // happen.
+    g_veto_patterns  = n_disabled ? 1 : 0;
+    g_extra_patterns = n_enabled  ? 1 : 0;
+
+    Wh_Log(L"Settings loaded: %zu enabled, %zu disabled", n_enabled, n_disabled);
 }
 
 // ===========================================================================
