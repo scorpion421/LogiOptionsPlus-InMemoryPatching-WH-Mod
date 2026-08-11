@@ -2,7 +2,7 @@
 // @id              logioptionsplus-smooth-scroll
 // @name            Logi Options+ Smooth Scroll for All Apps
 // @description     Enables high-resolution smooth mouse wheel scrolling in any application, not just browsers. Port of igvk/LogiOptionsPlus-InMemoryPatching.
-// @version         2.3.0
+// @version         2.4.0
 // @author          MickyFoley
 // @github          https://github.com/scorpion421
 // @include         logioptionsplus_agent.exe
@@ -53,13 +53,28 @@ point inside the foreground-process check function. A small assembly handler
 (one per known agent version) reconstructs the original register state and
 calls back into the decision logic.
 
-- Targets all known Logi Options+ agent versions (1.00 through 1.94).
+- Targets all known Logi Options+ agent versions (1.00 through 2.06).
 - No files are written to disk; everything happens in memory.
 - No `version.dll` deployment required. No reconfiguration after Logi Options+ updates.
 - Settings changes apply immediately without restarting the agent.
 - Original project: https://github.com/igvk/LogiOptionsPlus-InMemoryPatching by igvk (MIT License)
 
 ## Changelog
+
+### 2.4.0
+
+- **Support for Logi Options+ agent 2.06.** Added the V206 code signature, hook
+  bytes and assembly handler, tried ahead of the older versions as upstream
+  does. Ported from igvk/LogiOptionsPlus-InMemoryPatching version 2.6.
+
+  The new handler follows the same shape as V194 -- the hook point is again a
+  common exit for two paths through the agent's check -- but the agent keeps its
+  frame pointer in R14 rather than R15, and the string buffer sits at a
+  different frame offset. It gets the same register preservation and
+  pass-through handling as the other versions.
+
+  No change to settings or matching behaviour. Every handler's replayed
+  epilogue was verified byte-identical to the hook bytes it replaces.
 
 ### 2.3.0
 
@@ -186,6 +201,10 @@ static const uint8_t k_target_V194[] = {
     0x48, 0x8D, 0x4D, 0x00, 0x48, 0x83, 0xFE, 0x0F, 0x48, 0x0F, 0x47, 0xCF,
     0x48, 0x83, 0xFB, 0x0B, 0x75, 0x17, 0x4C, 0x8B, 0xC3
 };
+static const uint8_t k_target_V206[] = {
+    0x48, 0x8D, 0x4D, 0x40, 0x48, 0x83, 0xFE, 0x0F, 0x48, 0x0F, 0x47, 0xCF,
+    0x48, 0x83, 0xFB, 0x0B, 0x75, 0x17, 0x4C, 0x8B, 0xC3
+};
 
 // HOOK_MACHINE_CODE: the byte sequence right after the target signature that
 // gets overwritten by the injected E9 jump (5 bytes minimum). One per version.
@@ -194,6 +213,7 @@ static const uint8_t k_hook_V146[] = { 0x41, 0x88, 0x44, 0x24, 0x28, 0x4D, 0x8B,
 static const uint8_t k_hook_V168[] = { 0x41, 0x88, 0x44, 0x24, 0x28, 0x4D, 0x8B, 0x64, 0x24, 0x08 };
 static const uint8_t k_hook_V186[] = { 0x41, 0x88, 0x44, 0x24, 0x28, 0x4D, 0x8B, 0x64, 0x24, 0x08 };
 static const uint8_t k_hook_V194[] = { 0x41, 0x88, 0x47, 0x28, 0x49, 0x8B, 0x7F, 0x08 };
+static const uint8_t k_hook_V206[] = { 0x41, 0x88, 0x46, 0x28, 0x49, 0x8B, 0x7E, 0x08 };
 
 // Maximum byte distance to search for the hook sequence after the signature.
 static constexpr size_t k_max_hook_disp = 0x20;
@@ -427,6 +447,7 @@ extern "C" {
     void injected_handler_V168();
     void injected_handler_V186();
     void injected_handler_V194();
+    void injected_handler_V206();
 }
 
 __asm__(
@@ -723,6 +744,64 @@ __asm__(
     "    mov rdi, [r15+0x8]\n"
     "    jmp [rip + original_jump_address]\n"
 
+    // ---- V206 ----
+    ".globl injected_handler_V206\n"
+    "injected_handler_V206:\n"
+    // Save the agent's flags first, so the bypass path below is fully
+    // transparent. This lowers RSP by 8; any RSP-relative operand in the
+    // argument setup is offset accordingly.
+    "    pushfq\n"
+    // Bypass: skip everything when the outcome cannot differ from the
+    // value the agent already computed in AL.
+    "    test al, al\n"
+    "    jnz .Lveto_V206\n"
+    "    cmp byte ptr [rip + g_extra_patterns], 0\n"
+    "    je .Lpass_V206\n"
+    "    jmp .Lfull_V206\n"
+    ".Lveto_V206:\n"
+    "    cmp byte ptr [rip + g_veto_patterns], 0\n"
+    "    je .Lpass_V206\n"
+    ".Lfull_V206:\n"
+    // Arguments come from the agent's mid-function register state, so they
+    // must be computed before anything below moves RSP again.
+    "    lea rcx, [rbp+0xB0-0x70]\n"
+    "    cmp rsi, 0xF\n"
+    "    cmova rcx, rdi\n"
+    "    mov rdx, rbx\n"
+    "    movzx r8, al\n"
+    // Preserve volatile GP and XMM registers, align RSP to 16 and reserve
+    // our own shadow space (see the note above this block).
+    "    push r9\n"
+    "    push r10\n"
+    "    push r11\n"
+    "    mov r11, rsp\n"
+    "    and rsp, -16\n"
+    "    sub rsp, 144\n"
+    "    mov [rsp+128], r11\n"
+    "    movaps [rsp+32], xmm0\n"
+    "    movaps [rsp+48], xmm1\n"
+    "    movaps [rsp+64], xmm2\n"
+    "    movaps [rsp+80], xmm3\n"
+    "    movaps [rsp+96], xmm4\n"
+    "    movaps [rsp+112], xmm5\n"
+    "    call patched_switch_foreground_process_handler\n"
+    "    movaps xmm0, [rsp+32]\n"
+    "    movaps xmm1, [rsp+48]\n"
+    "    movaps xmm2, [rsp+64]\n"
+    "    movaps xmm3, [rsp+80]\n"
+    "    movaps xmm4, [rsp+96]\n"
+    "    movaps xmm5, [rsp+112]\n"
+    "    mov rsp, [rsp+128]\n"
+    "    pop r11\n"
+    "    pop r10\n"
+    "    pop r9\n"
+    ".Lpass_V206:\n"
+    "    popfq\n"
+    // Replay the two overwritten instructions, then resume the agent.
+    "    mov [r14+0x28], al\n"
+    "    mov rdi, [r14+0x8]\n"
+    "    jmp [rip + original_jump_address]\n"
+
     ".att_syntax prefix\n"
 );
 
@@ -903,6 +982,7 @@ struct VersionEntry {
 };
 
 static const VersionEntry g_versions[] = {
+    { k_target_V206, sizeof k_target_V206, k_hook_V206, sizeof k_hook_V206, injected_handler_V206, L"V206" },
     { k_target_V194, sizeof k_target_V194, k_hook_V194, sizeof k_hook_V194, injected_handler_V194, L"V194" },
     { k_target_V186, sizeof k_target_V186, k_hook_V186, sizeof k_hook_V186, injected_handler_V186, L"V186" },
     { k_target_V168, sizeof k_target_V168, k_hook_V168, sizeof k_hook_V168, injected_handler_V168, L"V168" },
