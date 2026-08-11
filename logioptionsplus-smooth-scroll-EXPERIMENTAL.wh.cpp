@@ -2,7 +2,7 @@
 // @id              logioptionsplus-smooth-scroll-experimental
 // @name            Logi Options+ Smooth Scroll for All Apps (experimental)
 // @description     Structural-discovery build. Locates the patch site by string cross-reference instead of hardcoded signatures, and generates its trampoline at runtime.
-// @version         3.0.0-exp1
+// @version         3.0.0-exp4
 // @author          MickyFoley
 // @github          https://github.com/scorpion421
 // @include         logioptionsplus_agent.exe
@@ -38,11 +38,14 @@ This build derives the patch site from the structure of the code instead.
 2. Scan the agent's code for a RIP-relative `lea rdx, [rip+disp32]` that resolves
    to that literal. This is the argument setup for the comparison against the
    browser name.
-3. Immediately before it, expect the length pre-check the compiler emits ahead of
-   the comparison: `cmp <reg>, 11` followed by `jne <rel8>`, then
-   `mov r8, <same reg>`. Eleven is the length of `firefox.exe`.
-4. The `jne` skips the comparison, so its target is where both paths converge --
-   which is exactly the patch site.
+3. Before it, find the length pre-check the compiler emits ahead of the
+   comparison: `cmp <reg>, 11` followed by a `jne`, with the same register handed
+   to the comparison as its size argument. Eleven is the length of
+   `firefox.exe`. The agent chains several such comparisons; the anchor's own
+   length selects the right link.
+4. Follow the `jne`. It lands in the tail that produces the result, and the
+   store of that result sits at or just after it, once the matching and
+   non-matching paths converge. That store is the patch site.
 5. Before the length check sits the small-string-optimization triple
    (`lea rcx, [frame+disp]` / `cmp <reg>, 15 or 16` / `cmov rcx, <reg>`) that
    produces the pointer to the name.
@@ -72,12 +75,14 @@ written:
   the length check and the `mov r8` name the same register,
 - the SSO triple decodes to `lea` into RCX and `cmov` into RCX,
 - the `jne` target lies inside the same executable section,
-- the target decodes to exactly `mov [<base>+0x28], al` followed by
-  `mov <reg>, [<base>+0x8]`, both through the same base register,
+- within a short window at that target there is exactly `mov [<base>+0x28], al`
+  followed by `mov <reg>, [<base>+0x8]`, both through the same base register,
 - the overwritten range is at least 5 bytes, so an `E9` fits,
 - and exactly one candidate survives. Ambiguity aborts.
 
-If anything fails, the mod does nothing and says why in the log.
+If anything fails, the mod does nothing and says why in the log. When an anchor
+reference cannot be resolved, the bytes around it are dumped so an unfamiliar
+layout can be read out of the log rather than guessed at.
 
 ## Verification
 
@@ -91,7 +96,13 @@ six known agent layouts (1.00 through 2.06), with no version knowledge supplied:
   preservation of R9, R10, R11 and RFLAGS,
 - eleven deliberately corrupted variants (wrong compared length, mismatched
   registers, altered branch, wrong store target or offset, and others) were all
-  refused rather than patched.
+  refused rather than patched,
+- and, most importantly, against the actual instruction bytes captured from a
+  shipping agent (2.06). There the anchor is the second link in a chain of name
+  comparisons, and the branch after its length check lands two instructions
+  short of the patch site. Discovery selects the correct link and the correct
+  site, and the stub it generates is identical to the hand-written handler for
+  that version.
 
 RFLAGS are preserved exactly on the pass-through path. On the deciding path they
 are clobbered, as they were in every previous version and upstream: two code
@@ -414,20 +425,6 @@ static bool DecodeCmovToReg(const uint8_t* p, size_t avail, unsigned& dest)
     return true;
 }
 
-// mov r64, r64  ->  REX.W [+R/B] 8B /r   (ModRM.reg = dest, ModRM.rm = source)
-static bool DecodeMovRegFromReg(const uint8_t* p, size_t avail, unsigned& dst, unsigned& src)
-{
-    if (avail < 3) return false;
-    const uint8_t rex = p[0];
-    if ((rex & 0xF8) != 0x48) return false;
-    if (p[1] != 0x8B) return false;
-    const uint8_t modrm = p[2];
-    if ((modrm >> 6) != 3) return false;
-    dst = reg_of(rex, (modrm >> 3) & 7, 0x04);
-    src = reg_of(rex, modrm & 7, 0x01);
-    return true;
-}
-
 // mov byte ptr [base + disp8], al   ->  [REX.B] 88 /0 [SIB] disp8
 // The agent stores its verdict this way. Sets len and base.
 static bool DecodeStoreAl(const uint8_t* p, size_t avail, size_t& len,
@@ -547,97 +544,178 @@ static bool ValidateHookSite(uint8_t* p, size_t avail, size_t& hook_len)
     return true;
 }
 
+// Dumps raw bytes around an address, so a layout this build does not yet
+// understand can be read out of the log instead of guessed at.
+static void LogBytesAround(uint8_t* p, const Section& sec, size_t before, size_t after)
+{
+    uint8_t* lo = (p - before < sec.base) ? sec.base : p - before;
+    uint8_t* hi = (p + after > sec.base + sec.size) ? sec.base + sec.size : p + after;
+
+    for (uint8_t* line = lo; line < hi; line += 16) {
+        wchar_t buf[128];
+        int n = swprintf(buf, 96, L"  %p%s ", line, (line <= p && p < line + 16) ? L" *" : L"  ");
+        for (uint8_t* b = line; b < line + 16 && b < hi; b++)
+            n += swprintf(buf + n, 8, L"%02X ", *b);
+        Wh_Log(L"%s", buf);
+    }
+}
+
 // Walks back from the anchor reference to the structure that precedes it and
 // fills in 'out'. Returns false if anything does not decode as expected.
+//
+// The length pre-check is searched for within a window rather than assumed to
+// sit at a fixed offset: what the compiler emits between the check and the
+// comparison setup is not fixed, and an earlier build of this file assumed an
+// order that the shipping agent does not use.
 static bool ResolveFromAnchorRef(uint8_t* lea_rdx, const Section& code, Site& out)
 {
-    // Layout immediately before the anchor reference:
-    //   <lea rcx,[frame+disp]> <cmp reg,15|16> <cmov rcx,reg>   (the SSO triple)
-    //   <cmp len_reg, 11>
-    //   <jne rel8>            -> target is the patch site
-    //   <mov r8, len_reg>
-    //   <lea rdx, [rip -> "firefox.exe"]>   <- we are here
-    //
-    // mov r8,len_reg is 3 bytes, jne is 2, the length check is 4.
-    if (lea_rdx < code.base + 32)
+    // Shape being looked for, reading forward:
+    //   <lea rcx,[frame+disp]> <cmp reg,15|16> <cmov rcx,reg>   the SSO triple
+    //   <cmp len_reg, 11>                                       the length check
+    //   <jne ...>              -> target is the patch site
+    //   ... possibly a few instructions ...
+    //   <lea rdx, [rip -> anchor]>                              <- entry point
+    constexpr size_t k_window = 48;   // how far back the length check may sit
+
+    if (lea_rdx < code.base + k_window + 24)
         return false;
 
-    uint8_t* p_movr8 = lea_rdx - 3;
-    unsigned movr8_dst = 0, movr8_src = 0;
-    if (!DecodeMovRegFromReg(p_movr8, 3, movr8_dst, movr8_src))
-        return false;
-    if (movr8_dst != 8)                     // destination must be R8
-        return false;
+    // Nearest match first: the length check is the last branch before the
+    // comparison it guards.
+    for (size_t back = 6; back <= k_window; back++) {
+        uint8_t* p_cmplen = lea_rdx - back;
 
-    uint8_t* p_jne = p_movr8 - 2;
-    if (p_jne[0] != 0x75)                   // JNE rel8
-        return false;
-    const int rel = static_cast<int8_t>(p_jne[1]);
-
-    uint8_t* p_cmplen = p_jne - 4;
-    unsigned len_reg = 0;
-    int imm = 0;
-    if (!DecodeCmpImm8(p_cmplen, 4, len_reg, imm))
-        return false;
-    if (imm != k_anchor_len)
-        return false;
-    if (len_reg != movr8_src)               // both must name the same register
-        return false;
-
-    // The SSO triple ends where the length check begins. Its lea is either 4 or
-    // 5 bytes depending on whether the frame register needs a SIB byte, so try
-    // both rather than assuming.
-    uint8_t* triple = nullptr;
-    size_t   triple_len = 0;
-    for (size_t lea_len = 4; lea_len <= 5; lea_len++) {
-        uint8_t* cand = p_cmplen - (lea_len + 4 + 4);
-        if (cand < code.base)
+        unsigned len_reg = 0;
+        int imm = 0;
+        if (!DecodeCmpImm8(p_cmplen, 4, len_reg, imm))
+            continue;
+        if (imm != k_anchor_len)
             continue;
 
-        size_t   got_len = 0;
-        unsigned lea_dst = 0;
-        if (!DecodeLea(cand, lea_len, got_len, lea_dst))
+        // The branch that skips the comparison, in either encoding.
+        uint8_t* p_j = p_cmplen + 4;
+        uint8_t* target = nullptr;
+        size_t   j_len = 0;
+        if (p_j[0] == 0x75) {                       // jne rel8
+            target = p_j + 2 + static_cast<int8_t>(p_j[1]);
+            j_len  = 2;
+        } else if (p_j[0] == 0x0F && p_j[1] == 0x85) {   // jne rel32
+            int32_t rel;
+            std::memcpy(&rel, p_j + 2, sizeof rel);
+            target = p_j + 6 + rel;
+            j_len  = 6;
+        } else {
             continue;
-        if (got_len != lea_len || lea_dst != 1)   // must load into RCX
-            continue;
-
-        unsigned sso_reg = 0;
-        int sso_imm = 0;
-        if (!DecodeCmpImm8(cand + lea_len, 4, sso_reg, sso_imm))
-            continue;
-        if (sso_imm != 15 && sso_imm != 16)       // the two encodings seen
-            continue;
-
-        unsigned cmov_dst = 0;
-        if (!DecodeCmovToReg(cand + lea_len + 4, 4, cmov_dst))
-            continue;
-        if (cmov_dst != 1)                        // must select into RCX
+        }
+        if (p_j + j_len > lea_rdx)                  // the branch must precede us
             continue;
 
-        triple     = cand;
-        triple_len = lea_len + 8;
-        break;
+        // The branch target is not the patch site itself.
+        //
+        // The agent chains several name comparisons. A failed length check
+        // jumps to the tail that produces the result -- typically the
+        // 'xor al, al' that means "no match" -- and the store follows a couple
+        // of instructions later, after the two result paths converge. In some
+        // builds the two coincide, in others they do not, so the store is
+        // searched for forward from the branch target rather than assumed to
+        // be at it.
+        if (target < code.base || target >= code.base + code.size)
+            continue;
+
+        uint8_t* hook = nullptr;
+        size_t   hook_len = 0;
+        {
+            // Only the small result tail is scanned. Anything longer would
+            // risk latching onto an unrelated store.
+            constexpr size_t k_tail = 16;
+            uint8_t* limit = target + k_tail;
+            if (limit > code.base + code.size)
+                limit = code.base + code.size;
+
+            for (uint8_t* q = target; q < limit; q++) {
+                const size_t avail = static_cast<size_t>((code.base + code.size) - q);
+                size_t len = 0;
+                if (ValidateHookSite(q, avail, len)) {
+                    hook     = q;
+                    hook_len = len;
+                    break;
+                }
+            }
+        }
+        if (!hook)
+            continue;
+
+        // The SSO triple ends where the length check begins. Its lea is either
+        // four or five bytes depending on whether the frame register needs a
+        // SIB byte, so try both rather than assuming.
+        uint8_t* triple = nullptr;
+        size_t   triple_len = 0;
+        for (size_t lea_len = 4; lea_len <= 5; lea_len++) {
+            uint8_t* cand = p_cmplen - (lea_len + 8);
+            if (cand < code.base)
+                continue;
+
+            size_t   got_len = 0;
+            unsigned lea_dst = 0;
+            if (!DecodeLea(cand, lea_len, got_len, lea_dst))
+                continue;
+            if (got_len != lea_len || lea_dst != 1)      // must load into RCX
+                continue;
+
+            unsigned sso_reg = 0;
+            int sso_imm = 0;
+            if (!DecodeCmpImm8(cand + lea_len, 4, sso_reg, sso_imm))
+                continue;
+            if (sso_imm != 15 && sso_imm != 16)          // the encodings seen
+                continue;
+
+            unsigned cmov_dst = 0;
+            if (!DecodeCmovToReg(cand + lea_len + 4, 4, cmov_dst))
+                continue;
+            if (cmov_dst != 1)                           // must select into RCX
+                continue;
+
+            triple     = cand;
+            triple_len = lea_len + 8;
+            break;
+        }
+        if (!triple)
+            continue;
+
+        // Required cross-check: between the branch and the anchor reference, the
+        // same register that was length-checked must be handed to the
+        // comparison as its size argument (R8 under the Win64 convention).
+        //
+        // This is what separates the real call site from any other comparison
+        // against the value 11 that happens to sit near an anchor reference.
+        // Its position is not fixed, so it is searched for rather than assumed,
+        // but its absence is fatal.
+        bool size_arg_ok = false;
+        for (uint8_t* q = p_j + j_len; q + 3 <= lea_rdx; q++) {
+            const bool w64 = (q[0] == 0x4C || q[0] == 0x4D);   // mov r8, r64
+            const bool w32 = (q[0] == 0x44 || q[0] == 0x45);   // mov r8d, r32
+            if (!(w64 || w32) || q[1] != 0x8B)
+                continue;
+            if ((q[2] >> 6) != 3)
+                continue;
+            if (((q[2] >> 3) & 7) != 0)                        // destination R8
+                continue;
+            const unsigned src = (q[2] & 7) | ((q[0] & 1) ? 8u : 0u);
+            if (src == len_reg) { size_arg_ok = true; break; }
+        }
+        if (!size_arg_ok)
+            continue;
+
+        out.triple     = triple;
+        out.triple_len = triple_len;
+        out.len_reg    = len_reg;
+        out.hook       = hook;
+        out.hook_len   = hook_len;
+        out.resume     = hook + hook_len;
+        return true;
     }
-    if (!triple)
-        return false;
 
-    // The jump target is the patch site.
-    uint8_t* hook = p_jne + 2 + rel;
-    if (hook < code.base || hook >= code.base + code.size)
-        return false;
-
-    const size_t avail = static_cast<size_t>((code.base + code.size) - hook);
-    size_t hook_len = 0;
-    if (!ValidateHookSite(hook, avail, hook_len))
-        return false;
-
-    out.triple     = triple;
-    out.triple_len = triple_len;
-    out.len_reg    = len_reg;
-    out.hook       = hook;
-    out.hook_len   = hook_len;
-    out.resume     = hook + hook_len;
-    return true;
+    return false;
 }
 
 // Finds the patch site. Requires exactly one candidate to survive validation.
@@ -694,8 +772,9 @@ static bool DiscoverSite(const std::string& anchor, Site& out)
 
             Site cand;
             if (!ResolveFromAnchorRef(s.base + i, s, cand)) {
-                Wh_Log(L"discover: reference at %p does not match the expected shape",
-                       s.base + i);
+                Wh_Log(L"discover: reference at %p does not match the expected shape; "
+                       L"surrounding bytes follow", s.base + i);
+                LogBytesAround(s.base + i, s, 64, 32);
                 continue;
             }
 
