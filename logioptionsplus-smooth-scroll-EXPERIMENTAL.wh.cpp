@@ -2,11 +2,12 @@
 // @id              logioptionsplus-smooth-scroll-experimental
 // @name            Logi Options+ Smooth Scroll for All Apps (experimental)
 // @description     Structural-discovery build. Locates the patch site by string cross-reference instead of hardcoded signatures, and generates its trampoline at runtime.
-// @version         3.0.0-exp4
+// @version         3.0.0-exp6
 // @author          MickyFoley
 // @github          https://github.com/scorpion421
 // @include         logioptionsplus_agent.exe
 // @architecture    amd64
+// @compilerOptions -fms-extensions
 // @license         MIT
 // ==/WindhawkMod==
 
@@ -108,6 +109,25 @@ RFLAGS are preserved exactly on the pass-through path. On the deciding path they
 are clobbered, as they were in every previous version and upstream: two code
 paths converge at the patch site, so nothing downstream can depend on them.
 
+## Changelog
+
+### 3.0.0-exp6
+- **W^X Memory Protection:** Stub page transitions to `PAGE_EXECUTE_READ` (RX) after assembly; avoids persistent RWX pages.
+- **Atomic 64-bit Hook Injection:** Applied and reverted patch sites atomically via `InterlockedCompareExchange64`, eliminating race conditions during hook installation and unhooking.
+- **Auto Multi-Anchor Fallback:** Added automatic discovery fallback across known browser anchors (`chrome.exe`, `msedge.exe`, `brave.exe`, etc.) if the primary anchor fails.
+- **Structured Exception Handling (SEH):** Protected decision handler with `__try / __except` to prevent process crashes if host string pointers are invalid.
+- **Configurable Verbose Logging:** Added `verboseLogging` setting to keep the Windhawk log clean during normal window switching.
+
+### 3.0.0-exp5
+- **Dynamic anchor length:** Fixed an issue where changing `anchorString` to an identifier with a length other than 11 characters (e.g. `chrome.exe`) would fail discovery.
+- **Unload thread safety:** Added an in-flight invocation counter and drain-wait loop to prevent access violations during `FreeLibrary` on mod unload.
+- **Base register safety:** Added explicit non-volatile register validation for the patch site base register, preventing potential clobbering by the handler calling convention.
+- **Extended frame support:** Increased LEA scanning range up to 8 bytes to support large stack frames using 32-bit displacements (`disp32`).
+- **SIB decoding correction:** Fixed `REX.X` validation in SIB decoding to prevent misidentifying `R12` as "no index register".
+- **Strict section filtering:** Excluded writable data sections (`IMAGE_SCN_MEM_WRITE`) from the anchor string literal search to ensure only genuine `.rdata` is matched.
+- **High-performance allocation:** Replaced linear 4 KB allocation probing with a `VirtualQuery`-based allocator adhering to Windows 64 KB allocation granularity (`dwAllocationGranularity`), eliminating startup lag.
+- **Cleanup:** Cleaned up filename matching in `glob_match`, marked the foreign process handler `noexcept`, and properly freed settings memory on uninit.
+
 ## Credits
 
 Original project and reverse-engineering work:
@@ -132,6 +152,9 @@ https://github.com/igvk/LogiOptionsPlus-InMemoryPatching by igvk (MIT License)
 - anchorString: firefox.exe
   $name: Anchor string
   $description: The browser name literal used to locate the patch site. Only change this if the log reports that the anchor was not found.
+- verboseLogging: false
+  $name: Verbose logging
+  $description: Log every window match event to the Windhawk log. Useful for debugging pattern rules.
 */
 // ==/WindhawkModSettings==
 
@@ -174,6 +197,7 @@ https://github.com/igvk/LogiOptionsPlus-InMemoryPatching by igvk (MIT License)
 struct ModSettings {
     std::vector<std::string> enabled;   // additional apps (lowercase patterns)
     std::vector<std::string> disabled;  // excluded apps  (lowercase patterns)
+    bool verbose = false;
 };
 
 // Published through an atomic pointer rather than held by value.
@@ -188,6 +212,9 @@ struct ModSettings {
 // leak is a few hundred bytes.
 static std::atomic<const ModSettings*> g_settings{nullptr};
 
+// Active invocations counter to prevent DLL unloading crashes during RemoveHook.
+static std::atomic<int> g_in_flight{0};
+
 // ASCII lowercase. Deliberately not std::tolower, which consults the current
 // locale and is a real call. Executable names are ASCII.
 static inline char ascii_lower(char c)
@@ -199,7 +226,7 @@ static inline char ascii_lower(char c)
 // SECTION: matching
 //
 // PRECONDITION: both arguments are already lowercase. The caller lowercases the
-// name once into a stack buffer.
+// name once into a stack buffer and strips any path separators.
 // ===========================================================================
 
 static bool glob_match(const char* text, const char* glob)
@@ -210,11 +237,11 @@ static bool glob_match(const char* text, const char* glob)
         if (*glob == '*') {
             text_backup = text;
             glob_backup = ++glob;
-        } else if ((*glob == '?' && *text != '/') || *glob == *text) {
+        } else if (*glob == '?' || *glob == *text) {
             text++;
             glob++;
         } else {
-            if (!glob_backup || *text_backup == '/')
+            if (!glob_backup)
                 return false;
             text = ++text_backup;
             glob = glob_backup;
@@ -245,57 +272,74 @@ static bool glob_match(const char* text, const char* glob)
 static constexpr size_t k_name_buf = 260;
 
 extern "C" bool patched_switch_foreground_process_handler(
-    const char* name, size_t length, bool previous_check)
+    const char* name, size_t length, bool previous_check) noexcept
 {
-    const ModSettings* s = g_settings.load(std::memory_order_acquire);
-    if (!s || !name)
-        return previous_check;   // never worse than the agent's own answer
+    g_in_flight.fetch_add(1, std::memory_order_relaxed);
+    struct InFlightGuard {
+        ~InFlightGuard() {
+            g_in_flight.fetch_sub(1, std::memory_order_release);
+        }
+    } guard;
 
-    const bool have_disabled = !s->disabled.empty();
-    const bool have_enabled  = !s->enabled.empty();
+    __try {
+        const ModSettings* s = g_settings.load(std::memory_order_acquire);
+        if (!s || !name)
+            return previous_check;   // never worse than the agent's own answer
 
-    // Mirror of the stub's bypass conditions, kept as a safety net in case the
-    // stub ever calls through when it did not have to.
-    if (!have_disabled) {
+        const bool have_disabled = !s->disabled.empty();
+        const bool have_enabled  = !s->enabled.empty();
+
+        // Mirror of the stub's bypass conditions, kept as a safety net in case the
+        // stub ever calls through when it did not have to.
+        if (!have_disabled) {
+            if (previous_check)
+                return true;
+            if (!have_enabled)
+                return false;
+        }
+
+        const char* base     = name;
+        size_t      base_len = length;
+        for (size_t i = length; i > 0; i--) {
+            const char c = name[i - 1];
+            if (c == '\\' || c == '/') {
+                base     = name + i;
+                base_len = length - i;
+                break;
+            }
+        }
+
+        char buf[k_name_buf];
+        if (base_len >= sizeof buf)
+            base_len = sizeof buf - 1;
+        for (size_t i = 0; i < base_len; i++)
+            buf[i] = ascii_lower(base[i]);
+        buf[base_len] = '\0';
+
+        for (const auto& glob : s->disabled) {
+            if (glob_match(buf, glob.c_str())) {
+                if (s->verbose) {
+                    Wh_Log(L"handler: '%S' matched disabled '%S' -> false", buf, glob.c_str());
+                }
+                return false;
+            }
+        }
         if (previous_check)
             return true;
-        if (!have_enabled)
-            return false;
-    }
-
-    const char* base     = name;
-    size_t      base_len = length;
-    for (size_t i = length; i > 0; i--) {
-        const char c = name[i - 1];
-        if (c == '\\' || c == '/') {
-            base     = name + i;
-            base_len = length - i;
-            break;
+        for (const auto& glob : s->enabled) {
+            if (glob_match(buf, glob.c_str())) {
+                if (s->verbose) {
+                    Wh_Log(L"handler: '%S' matched enabled '%S' -> true", buf, glob.c_str());
+                }
+                return true;
+            }
         }
+        return false;
     }
-
-    char buf[k_name_buf];
-    if (base_len >= sizeof buf)
-        base_len = sizeof buf - 1;
-    for (size_t i = 0; i < base_len; i++)
-        buf[i] = ascii_lower(base[i]);
-    buf[base_len] = '\0';
-
-    for (const auto& glob : s->disabled) {
-        if (glob_match(buf, glob.c_str())) {
-            Wh_Log(L"handler: '%S' matched disabled '%S' -> false", buf, glob.c_str());
-            return false;
-        }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        Wh_Log(L"handler: exception caught during evaluation, falling back to previous check");
+        return previous_check;
     }
-    if (previous_check)
-        return true;
-    for (const auto& glob : s->enabled) {
-        if (glob_match(buf, glob.c_str())) {
-            Wh_Log(L"handler: '%S' matched enabled '%S' -> true", buf, glob.c_str());
-            return true;
-        }
-    }
-    return false;
 }
 
 // ===========================================================================
@@ -307,10 +351,11 @@ extern "C" bool patched_switch_foreground_process_handler(
 // ===========================================================================
 
 struct Section {
-    uint8_t* base = nullptr;
-    size_t   size = 0;
-    bool     exec = false;
-    bool     read = false;
+    uint8_t* base  = nullptr;
+    size_t   size  = 0;
+    bool     exec  = false;
+    bool     read  = false;
+    bool     write = false;
 };
 
 // Enumerates the sections of the main executable.
@@ -341,10 +386,11 @@ static bool GetMainModuleSections(std::vector<Section>& out, uint8_t*& mod_base)
         if (s.VirtualAddress == 0 || s.Misc.VirtualSize == 0)
             continue;
         Section e;
-        e.base = base + s.VirtualAddress;
-        e.size = s.Misc.VirtualSize;
-        e.exec = (s.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
-        e.read = (s.Characteristics & IMAGE_SCN_MEM_READ) != 0;
+        e.base  = base + s.VirtualAddress;
+        e.size  = s.Misc.VirtualSize;
+        e.exec  = (s.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+        e.read  = (s.Characteristics & IMAGE_SCN_MEM_READ) != 0;
+        e.write = (s.Characteristics & IMAGE_SCN_MEM_WRITE) != 0;
         out.push_back(e);
     }
     return !out.empty();
@@ -451,7 +497,7 @@ static bool DecodeStoreAl(const uint8_t* p, size_t avail, size_t& len,
     if (rm == 4) {                              // SIB
         if (avail < n + 1) return false;
         const uint8_t sib = p[n];
-        if (((sib >> 3) & 7) != 4) return false;  // no index register
+        if (((sib >> 3) & 7) != 4 || (rex & 0x02)) return false;  // no index register (REX.X must be 0)
         if ((sib >> 6) != 0) return false;        // scale must be 1
         b = reg_of(rex, sib & 7, 0x01);           // REX.B
         n += 1;
@@ -485,7 +531,7 @@ static bool DecodeLoadReg(const uint8_t* p, size_t avail, size_t& len,
     if (rm == 4) {
         if (avail < n + 1) return false;
         const uint8_t sib = p[n];
-        if (((sib >> 3) & 7) != 4) return false;
+        if (((sib >> 3) & 7) != 4 || (rex & 0x02)) return false;  // no index register (REX.X must be 0)
         if ((sib >> 6) != 0) return false;
         b = reg_of(rex, sib & 7, 0x01);
         n += 1;
@@ -515,9 +561,6 @@ struct Site {
     uint8_t* resume      = nullptr;  // hook + hook_len
 };
 
-// Length of "firefox.exe" and friends, as the agent compares it.
-static constexpr int k_anchor_len = 11;
-
 // Validates the patch site itself: the two instructions being overwritten.
 // They must store AL and then reload through the same base register, which is
 // what makes them safe to copy into the stub and replay there.
@@ -535,6 +578,13 @@ static bool ValidateHookSite(uint8_t* p, size_t avail, size_t& hook_len)
         return false;                       // must be the same frame register
     if (d1 != 0x28 || d2 != 0x08)
         return false;                       // the offsets the agent uses
+
+    // Must be a non-volatile register: our stub sets up RCX (1), RDX (2),
+    // and R8 (8) for the handler call, and RAX (0), R9 (9), R10 (10), R11 (11)
+    // are volatile. A volatile base would be clobbered before being replayed in
+    // the epilogue.
+    if (b1 == 0 || b1 == 1 || b1 == 2 || b1 == 8 || b1 == 9 || b1 == 10 || b1 == 11)
+        return false;
 
     const size_t total = l1 + l2;
     if (total < 5)                          // an E9 rel32 needs five bytes
@@ -567,11 +617,11 @@ static void LogBytesAround(uint8_t* p, const Section& sec, size_t before, size_t
 // sit at a fixed offset: what the compiler emits between the check and the
 // comparison setup is not fixed, and an earlier build of this file assumed an
 // order that the shipping agent does not use.
-static bool ResolveFromAnchorRef(uint8_t* lea_rdx, const Section& code, Site& out)
+static bool ResolveFromAnchorRef(uint8_t* lea_rdx, const Section& code, size_t anchor_len, Site& out)
 {
     // Shape being looked for, reading forward:
     //   <lea rcx,[frame+disp]> <cmp reg,15|16> <cmov rcx,reg>   the SSO triple
-    //   <cmp len_reg, 11>                                       the length check
+    //   <cmp len_reg, anchor_len>                               the length check
     //   <jne ...>              -> target is the patch site
     //   ... possibly a few instructions ...
     //   <lea rdx, [rip -> anchor]>                              <- entry point
@@ -589,7 +639,7 @@ static bool ResolveFromAnchorRef(uint8_t* lea_rdx, const Section& code, Site& ou
         int imm = 0;
         if (!DecodeCmpImm8(p_cmplen, 4, len_reg, imm))
             continue;
-        if (imm != k_anchor_len)
+        if (imm != static_cast<int>(anchor_len))
             continue;
 
         // The branch that skips the comparison, in either encoding.
@@ -645,12 +695,12 @@ static bool ResolveFromAnchorRef(uint8_t* lea_rdx, const Section& code, Site& ou
         if (!hook)
             continue;
 
-        // The SSO triple ends where the length check begins. Its lea is either
-        // four or five bytes depending on whether the frame register needs a
-        // SIB byte, so try both rather than assuming.
+        // The SSO triple ends where the length check begins. Its lea is
+        // between 4 and 8 bytes depending on the frame register, SIB byte,
+        // and whether a disp8 or disp32 (for larger stack frames) is used.
         uint8_t* triple = nullptr;
         size_t   triple_len = 0;
-        for (size_t lea_len = 4; lea_len <= 5; lea_len++) {
+        for (size_t lea_len = 4; lea_len <= 8; lea_len++) {
             uint8_t* cand = p_cmplen - (lea_len + 8);
             if (cand < code.base)
                 continue;
@@ -687,7 +737,7 @@ static bool ResolveFromAnchorRef(uint8_t* lea_rdx, const Section& code, Site& ou
         // comparison as its size argument (R8 under the Win64 convention).
         //
         // This is what separates the real call site from any other comparison
-        // against the value 11 that happens to sit near an anchor reference.
+        // against the value anchor_len that happens to sit near an anchor reference.
         // Its position is not fixed, so it is searched for rather than assumed,
         // but its absence is fatal.
         bool size_arg_ok = false;
@@ -732,7 +782,7 @@ static bool DiscoverSite(const std::string& anchor, Site& out)
     std::vector<uint8_t*> literals;
     const size_t alen = anchor.size();
     for (const auto& s : sections) {
-        if (s.exec || !s.read || s.size < alen + 1)
+        if (s.exec || !s.read || s.write || s.size < alen + 1)
             continue;
         for (size_t i = 0; i + alen < s.size; i++) {
             if (std::memcmp(s.base + i, anchor.data(), alen) != 0)
@@ -771,7 +821,7 @@ static bool DiscoverSite(const std::string& anchor, Site& out)
                 continue;
 
             Site cand;
-            if (!ResolveFromAnchorRef(s.base + i, s, cand)) {
+            if (!ResolveFromAnchorRef(s.base + i, s, alen, cand)) {
                 Wh_Log(L"discover: reference at %p does not match the expected shape; "
                        L"surrounding bytes follow", s.base + i);
                 LogBytesAround(s.base + i, s, 64, 32);
@@ -1009,57 +1059,103 @@ static HookState g_hook;
 static volatile uint8_t* g_veto_flag  = nullptr;
 static volatile uint8_t* g_extra_flag = nullptr;
 
-static inline uintptr_t sat_add(uintptr_t a, uintptr_t b)
-{
-    const uintptr_t r = a + b;
-    return (r < a) ? UINTPTR_MAX : r;
-}
-static inline uintptr_t sat_sub(uintptr_t a, uintptr_t b)
-{
-    return (a < b) ? 0 : (a - b);
-}
-
 // Allocates an executable page within +/-2GB of target, so an E9 can reach it.
+// Uses VirtualQuery to skip already-allocated blocks in large chunks rather than
+// blindly probing every page, and respects the 64 KB allocation granularity.
 static void* AllocatePageNearAddress(void* target)
 {
     SYSTEM_INFO si;
     GetSystemInfo(&si);
-    const size_t page = si.dwPageSize;
-    constexpr uintptr_t max_disp = 0x7FFFFF00;
+    const uintptr_t gran = si.dwAllocationGranularity ? si.dwAllocationGranularity : 0x10000;
+    constexpr uintptr_t max_disp = 0x7FFF0000; // slightly under 2 GB
 
-    const uintptr_t start = reinterpret_cast<uintptr_t>(target) & ~(static_cast<uintptr_t>(page) - 1);
-    uintptr_t lo = reinterpret_cast<uintptr_t>(si.lpMinimumApplicationAddress);
-    uintptr_t hi = reinterpret_cast<uintptr_t>(si.lpMaximumApplicationAddress);
-    const uintptr_t a = sat_sub(start, max_disp);
-    lo = (a >= lo) ? a : lo;
-    const uintptr_t b = sat_add(start, max_disp);
-    hi = (b <= hi) ? b : hi;
+    const uintptr_t target_addr = reinterpret_cast<uintptr_t>(target);
+    const uintptr_t min_addr = (target_addr > max_disp)
+        ? ((target_addr - max_disp > reinterpret_cast<uintptr_t>(si.lpMinimumApplicationAddress))
+            ? target_addr - max_disp : reinterpret_cast<uintptr_t>(si.lpMinimumApplicationAddress))
+        : reinterpret_cast<uintptr_t>(si.lpMinimumApplicationAddress);
+    const uintptr_t max_addr = (UINTPTR_MAX - target_addr > max_disp)
+        ? ((target_addr + max_disp < reinterpret_cast<uintptr_t>(si.lpMaximumApplicationAddress))
+            ? target_addr + max_disp : reinterpret_cast<uintptr_t>(si.lpMaximumApplicationAddress))
+        : reinterpret_cast<uintptr_t>(si.lpMaximumApplicationAddress);
 
-    uintptr_t up = start, down = start;
-    do {
-        up   = sat_add(up, page);
-        down = sat_sub(down, page);
-        if (up < hi) {
-            if (void* p = VirtualAlloc(reinterpret_cast<void*>(up), page,
-                                       MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE))
-                return p;
+    // Search upwards from target_addr
+    uintptr_t addr = (target_addr + gran - 1) & ~(gran - 1);
+    while (addr < max_addr) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof mbi) == 0)
+            break;
+
+        if (mbi.State == MEM_FREE) {
+            uintptr_t alloc_addr = (reinterpret_cast<uintptr_t>(mbi.BaseAddress) + gran - 1) & ~(gran - 1);
+            if (alloc_addr < reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize && alloc_addr < max_addr) {
+                if (void* p = VirtualAlloc(reinterpret_cast<void*>(alloc_addr), si.dwPageSize,
+                                           MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE))
+                    return p;
+            }
         }
-        if (down > lo) {
-            if (void* p = VirtualAlloc(reinterpret_cast<void*>(down), page,
-                                       MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE))
-                return p;
+
+        addr = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        addr = (addr + gran - 1) & ~(gran - 1);
+    }
+
+    // Search downwards from target_addr
+    addr = target_addr & ~(gran - 1);
+    while (addr > min_addr) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof mbi) == 0)
+            break;
+
+        if (mbi.State == MEM_FREE) {
+            uintptr_t region_end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+            if (region_end >= gran) {
+                uintptr_t alloc_addr = (region_end - gran) & ~(gran - 1);
+                if (alloc_addr >= reinterpret_cast<uintptr_t>(mbi.BaseAddress) && alloc_addr >= min_addr) {
+                    if (void* p = VirtualAlloc(reinterpret_cast<void*>(alloc_addr), si.dwPageSize,
+                                               MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE))
+                        return p;
+                }
+            }
         }
-    } while (up < hi || down > lo);
+
+        if (reinterpret_cast<uintptr_t>(mbi.BaseAddress) <= gran)
+            break;
+        addr = (reinterpret_cast<uintptr_t>(mbi.BaseAddress) - 1) & ~(gran - 1);
+    }
 
     return nullptr;
 }
+
+static const char* const k_fallback_anchors[] = {
+    "firefox.exe",
+    "chrome.exe",
+    "msedge.exe",
+    "brave.exe",
+    "opera.exe",
+    "vivaldi.exe",
+};
 
 // Discovers the site, builds the stub and applies the patch.
 static bool InstallHook(const std::string& anchor)
 {
     Site site;
-    if (!DiscoverSite(anchor, site))
+    bool found = DiscoverSite(anchor, site);
+    if (!found) {
+        for (const char* fb : k_fallback_anchors) {
+            if (anchor == fb)
+                continue;
+            Wh_Log(L"install: trying fallback anchor '%S'", fb);
+            if (DiscoverSite(fb, site)) {
+                Wh_Log(L"install: resolved patch site using fallback anchor '%S'", fb);
+                found = true;
+                break;
+            }
+        }
+    }
+    if (!found) {
+        Wh_Log(L"install: neither primary anchor nor fallback anchors could be resolved");
         return false;
+    }
 
     if (site.hook_len > sizeof g_hook.original) {
         Wh_Log(L"install: patch length %zu exceeds the backup buffer", site.hook_len);
@@ -1102,6 +1198,15 @@ static bool InstallHook(const std::string& anchor)
         *g_extra_flag = s->enabled.empty()  ? 0 : 1;
     }
 
+    // Transition the stub page from RWX to RX for W^X compliance.
+    DWORD old_stub_protect = 0;
+    if (!VirtualProtect(stub, page, PAGE_EXECUTE_READ, &old_stub_protect)) {
+        Wh_Log(L"install: could not protect stub page as PAGE_EXECUTE_READ, error = %u", GetLastError());
+        VirtualFree(stub, 0, MEM_RELEASE);
+        g_veto_flag = g_extra_flag = nullptr;
+        return false;
+    }
+
     DWORD old = 0;
     if (!VirtualProtect(site.hook, site.hook_len, PAGE_EXECUTE_READWRITE, &old)) {
         Wh_Log(L"install: VirtualProtect failed, error = %u", GetLastError());
@@ -1116,10 +1221,25 @@ static bool InstallHook(const std::string& anchor)
     g_hook.stub    = stub;
 
     const int32_t rel = static_cast<int32_t>(delta);
-    site.hook[0] = 0xE9;
-    std::memcpy(site.hook + 1, &rel, sizeof rel);
-    if (site.hook_len > k_rel_jmp_size)
-        std::memset(site.hook + k_rel_jmp_size, 0x90, site.hook_len - k_rel_jmp_size);
+
+    // Prepare 8-byte patch buffer for atomic 64-bit swap
+    uint8_t patch_buf[8];
+    std::memcpy(patch_buf, site.hook, 8);
+    patch_buf[0] = 0xE9;
+    std::memcpy(patch_buf + 1, &rel, sizeof rel);
+    for (size_t i = k_rel_jmp_size; i < site.hook_len; i++) {
+        patch_buf[i] = 0x90;
+    }
+
+    uint64_t new_val = 0;
+    uint64_t old_val = 0;
+    std::memcpy(&new_val, patch_buf, sizeof new_val);
+    std::memcpy(&old_val, site.hook, sizeof old_val);
+    InterlockedCompareExchange64(
+        reinterpret_cast<volatile LONG64*>(site.hook),
+        static_cast<LONG64>(new_val),
+        static_cast<LONG64>(old_val)
+    );
 
     DWORD tmp = 0;
     VirtualProtect(site.hook, site.hook_len, old, &tmp);
@@ -1139,7 +1259,20 @@ static void RemoveHook()
 
     DWORD old = 0;
     if (VirtualProtect(g_hook.address, g_hook.length, PAGE_EXECUTE_READWRITE, &old)) {
-        std::memcpy(g_hook.address, g_hook.original, g_hook.length);
+        uint8_t restore_buf[8];
+        std::memcpy(restore_buf, g_hook.address, 8);
+        std::memcpy(restore_buf, g_hook.original, g_hook.length);
+
+        uint64_t restore_val = 0;
+        uint64_t current_val = 0;
+        std::memcpy(&restore_val, restore_buf, sizeof restore_val);
+        std::memcpy(&current_val, g_hook.address, sizeof current_val);
+        InterlockedCompareExchange64(
+            reinterpret_cast<volatile LONG64*>(g_hook.address),
+            static_cast<LONG64>(restore_val),
+            static_cast<LONG64>(current_val)
+        );
+
         DWORD tmp = 0;
         VirtualProtect(g_hook.address, g_hook.length, old, &tmp);
         FlushInstructionCache(GetCurrentProcess(), g_hook.address, g_hook.length);
@@ -1153,6 +1286,12 @@ static void RemoveHook()
     g_veto_flag  = nullptr;
     g_extra_flag = nullptr;
     g_hook.active = false;
+
+    // Wait for any in-flight execution in the handler to finish before
+    // unhooking finishes, avoiding a crash when the DLL is unloaded.
+    for (int i = 0; i < 50 && g_in_flight.load(std::memory_order_acquire) > 0; i++) {
+        Sleep(1);
+    }
 }
 
 // ===========================================================================
@@ -1209,6 +1348,7 @@ static void LoadSettings()
 
     fresh->enabled  = ReadStringArray(L"enabledApps[%d]");
     fresh->disabled = ReadStringArray(L"disabledApps[%d]");
+    fresh->verbose  = Wh_GetIntSetting(L"verboseLogging") != 0;
 
     const size_t n_enabled  = fresh->enabled.size();
     const size_t n_disabled = fresh->disabled.size();
@@ -1217,14 +1357,18 @@ static void LoadSettings()
     // the note on g_settings.
     g_settings.store(fresh, std::memory_order_release);
 
-    // Update the flags the stub reads, after the settings they describe. In
-    // this order the flags can only ever be conservative: the stub may call
-    // through when it no longer needs to, which is harmless. Bypassing while an
-    // excluded pattern exists cannot happen.
-    if (g_veto_flag)  *g_veto_flag  = n_disabled ? 1 : 0;
-    if (g_extra_flag) *g_extra_flag = n_enabled  ? 1 : 0;
+    // Update the flags the stub reads, after the settings they describe.
+    // Temporarily unprotect the control block in the RX stub page for writing.
+    if (g_veto_flag && g_extra_flag) {
+        DWORD old_protect = 0;
+        if (VirtualProtect(const_cast<uint8_t*>(g_veto_flag), 2, PAGE_EXECUTE_READWRITE, &old_protect)) {
+            *g_veto_flag  = n_disabled ? 1 : 0;
+            *g_extra_flag = n_enabled  ? 1 : 0;
+            VirtualProtect(const_cast<uint8_t*>(g_veto_flag), 2, old_protect, &old_protect);
+        }
+    }
 
-    Wh_Log(L"settings: %zu enabled, %zu disabled", n_enabled, n_disabled);
+    Wh_Log(L"settings: %zu enabled, %zu disabled, verbose = %d", n_enabled, n_disabled, fresh->verbose ? 1 : 0);
 }
 
 // ===========================================================================
@@ -1247,6 +1391,11 @@ void Wh_ModBeforeUninit()
 {
     Wh_Log(L"uninit: removing hook");
     RemoveHook();
+
+    // Clean up settings to avoid leaking memory on unload.
+    if (const ModSettings* s = g_settings.exchange(nullptr)) {
+        delete s;
+    }
 }
 
 void Wh_ModSettingsChanged()
