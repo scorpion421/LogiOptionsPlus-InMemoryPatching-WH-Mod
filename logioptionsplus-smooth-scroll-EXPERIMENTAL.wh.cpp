@@ -2,7 +2,7 @@
 // @id              logioptionsplus-smooth-scroll-experimental
 // @name            Logi Options+ Smooth Scroll for All Apps (experimental)
 // @description     Structural-discovery build. Locates the patch site by string cross-reference instead of hardcoded signatures, and generates its trampoline at runtime.
-// @version         3.0.0-exp6
+// @version         3.0.0-exp7
 // @author          MickyFoley
 // @github          https://github.com/scorpion421
 // @include         logioptionsplus_agent.exe
@@ -48,11 +48,11 @@ This build derives the patch site from the structure of the code instead.
    store of that result sits at or just after it, once the matching and
    non-matching paths converge. That store is the patch site.
 5. Before the length check sits the small-string-optimization triple
-   (`lea rcx, [frame+disp]` / `cmp <reg>, 15 or 16` / `cmov rcx, <reg>`) that
-   produces the pointer to the name.
+   (`lea rcx, [frame+disp]` / `cmp <reg_or_mem>, 15 or 16` / `cmov rcx, <reg_or_mem>`)
+   that produces the pointer to the name.
 
 Nothing above depends on exact byte values. Displacements, register allocation
-and the two encodings of the SSO check all vary across the known agent versions,
+and the encodings of the SSO check all vary across the known agent versions,
 and all are decoded rather than matched.
 
 ## Runtime trampoline
@@ -73,11 +73,14 @@ written:
 - the string is in a read-only section of the main module, the code in an
   executable one,
 - the length check, the `jne` and the `mov r8` decode exactly as expected, and
-  the length check and the `mov r8` name the same register,
-- the SSO triple decodes to `lea` into RCX and `cmov` into RCX,
+  the length check and the `mov r8` name the same non-volatile register (or use
+  constant propagation of the verified anchor length),
+- the SSO triple decodes to `lea` into RCX and `cmov` into RCX using only
+  non-volatile registers,
 - the `jne` target lies inside the same executable section,
 - within a short window at that target there is exactly `mov [<base>+0x28], al`
-  followed by `mov <reg>, [<base>+0x8]`, both through the same base register,
+  followed by `mov <reg>, [<base>+0x8]`, both through the same non-volatile base
+  register,
 - the overwritten range is at least 5 bytes, so an `E9` fits,
 - and exactly one candidate survives. Ambiguity aborts.
 
@@ -110,6 +113,14 @@ are clobbered, as they were in every previous version and upstream: two code
 paths converge at the patch site, so nothing downstream can depend on them.
 
 ## Changelog
+
+### 3.0.0-exp7
+- **True W^X Split-Page Stub:** Allocated separate `PAGE_READWRITE` data and `PAGE_EXECUTE_READ` code pages for the runtime stub, completely eliminating `PAGE_EXECUTE_READWRITE` (RWX) allocations and runtime `VirtualProtect` flips during settings reloads.
+- **Multi-Byte Patch Buffer Fix:** Fixed a stack buffer overflow in `InstallHook` and `RemoveHook` when `site.hook_len > 8`, while preserving atomic 64-bit `InterlockedCompareExchange64` patching for the jump header.
+- **Future-Proof Instruction Decoding:** Added support for 32-bit length comparisons, `0x89` register moves, constant-propagated `mov r8d, <anchor_len>` immediates, memory-operand SSO checks (`cmp`/`cmov` on stack frame), and signed `cmov` variants (`CMOVGE`/`CMOVG`).
+- **Strict Non-Volatile Register Validation:** Verified that `len_reg`, the `lea` frame base, and all SSO `cmp`/`cmov` source registers are non-volatile under the Win64 ABI so they cannot be clobbered before reaching the patch site.
+- **Safe Settings Reclamation & Unload Bypass:** Reclaimed retired `ModSettings` generations once in-flight calls drain, separated C++ RAII from SEH `__try / __except`, and zeroed stub control flags prior to unpatching.
+- **Input Normalization & Complete Verbose Logging:** Normalized user app entries (trimming quotes/whitespace, stripping accidental paths, appending `.exe` when omitted) and logged all foreground evaluation outcomes with deduplication when `verboseLogging` is active.
 
 ### 3.0.0-exp6
 - **W^X Memory Protection:** Stub page transitions to `PAGE_EXECUTE_READ` (RX) after assembly; avoids persistent RWX pages.
@@ -206,14 +217,18 @@ struct ModSettings {
 // runs on a Windhawk thread. Replacing a by-value ModSettings would destroy
 // vectors a handler might be iterating at that moment. Swapping a pointer is
 // atomic and keeps the hot path lock-free.
-//
-// Retired generations are intentionally leaked: a handler may still be reading
-// one when the swap happens, settings changes are rare and user-driven, and the
-// leak is a few hundred bytes.
 static std::atomic<const ModSettings*> g_settings{nullptr};
 
-// Active invocations counter to prevent DLL unloading crashes during RemoveHook.
+// Retired settings waiting for in-flight handlers to finish before deletion.
+static std::vector<const ModSettings*> g_retired_settings;
+
+// Active invocations counter to prevent DLL unloading crashes during RemoveHook
+// and to allow safe reclamation of retired ModSettings instances.
 static std::atomic<int> g_in_flight{0};
+
+// Last verbose log signature to avoid flooding the log during fullscreen
+// transitions that emit bursts of identical foreground events.
+static std::atomic<uint64_t> g_last_verbose_sig{0};
 
 // ASCII lowercase. Deliberately not std::tolower, which consults the current
 // locale and is a real call. Executable names are ASCII.
@@ -271,75 +286,99 @@ static bool glob_match(const char* text, const char* glob)
 
 static constexpr size_t k_name_buf = 260;
 
+static inline bool ShouldLogVerbose(const char* name, uint8_t outcome) noexcept
+{
+    uint64_t h = 14695981039346656037ULL;
+    for (const char* p = name; *p != '\0'; ++p) {
+        h ^= static_cast<uint8_t>(*p);
+        h *= 1099511628211ULL;
+    }
+    h ^= outcome;
+    h *= 1099511628211ULL;
+    const uint64_t prev = g_last_verbose_sig.exchange(h, std::memory_order_relaxed);
+    return prev != h;
+}
+
+// Separated from the SEH wrapper so no C++ objects with destructors coexist
+// in the same stack frame as __try / __except under Clang (-fms-extensions).
+static bool EvaluateForegroundProcess(
+    const char* name, size_t length, bool previous_check) noexcept
+{
+    const ModSettings* s = g_settings.load(std::memory_order_acquire);
+    if (!s || !name)
+        return previous_check;   // never worse than the agent's own answer
+
+    const bool have_disabled = !s->disabled.empty();
+    const bool have_enabled  = !s->enabled.empty();
+
+    // Mirror of the stub's bypass conditions when verbose logging is off.
+    if (!s->verbose && !have_disabled) {
+        if (previous_check)
+            return true;
+        if (!have_enabled)
+            return false;
+    }
+
+    const char* base     = name;
+    size_t      base_len = length;
+    for (size_t i = length; i > 0; i--) {
+        const char c = name[i - 1];
+        if (c == '\\' || c == '/') {
+            base     = name + i;
+            base_len = length - i;
+            break;
+        }
+    }
+
+    char buf[k_name_buf];
+    if (base_len >= sizeof buf)
+        base_len = sizeof buf - 1;
+    for (size_t i = 0; i < base_len; i++)
+        buf[i] = ascii_lower(base[i]);
+    buf[base_len] = '\0';
+
+    for (const auto& glob : s->disabled) {
+        if (glob_match(buf, glob.c_str())) {
+            if (s->verbose && ShouldLogVerbose(buf, 1)) {
+                Wh_Log(L"handler: '%S' matched disabled '%S' -> false", buf, glob.c_str());
+            }
+            return false;
+        }
+    }
+    if (previous_check) {
+        if (s->verbose && ShouldLogVerbose(buf, 2)) {
+            Wh_Log(L"handler: '%S' matched built-in browser detection -> true", buf);
+        }
+        return true;
+    }
+    for (const auto& glob : s->enabled) {
+        if (glob_match(buf, glob.c_str())) {
+            if (s->verbose && ShouldLogVerbose(buf, 3)) {
+                Wh_Log(L"handler: '%S' matched enabled '%S' -> true", buf, glob.c_str());
+            }
+            return true;
+        }
+    }
+    if (s->verbose && ShouldLogVerbose(buf, 4)) {
+        Wh_Log(L"handler: '%S' did not match any rule -> false", buf);
+    }
+    return false;
+}
+
 extern "C" bool patched_switch_foreground_process_handler(
     const char* name, size_t length, bool previous_check) noexcept
 {
-    g_in_flight.fetch_add(1, std::memory_order_relaxed);
-    struct InFlightGuard {
-        ~InFlightGuard() {
-            g_in_flight.fetch_sub(1, std::memory_order_release);
-        }
-    } guard;
-
+    g_in_flight.fetch_add(1, std::memory_order_acquire);
+    bool result = previous_check;
     __try {
-        const ModSettings* s = g_settings.load(std::memory_order_acquire);
-        if (!s || !name)
-            return previous_check;   // never worse than the agent's own answer
-
-        const bool have_disabled = !s->disabled.empty();
-        const bool have_enabled  = !s->enabled.empty();
-
-        // Mirror of the stub's bypass conditions, kept as a safety net in case the
-        // stub ever calls through when it did not have to.
-        if (!have_disabled) {
-            if (previous_check)
-                return true;
-            if (!have_enabled)
-                return false;
-        }
-
-        const char* base     = name;
-        size_t      base_len = length;
-        for (size_t i = length; i > 0; i--) {
-            const char c = name[i - 1];
-            if (c == '\\' || c == '/') {
-                base     = name + i;
-                base_len = length - i;
-                break;
-            }
-        }
-
-        char buf[k_name_buf];
-        if (base_len >= sizeof buf)
-            base_len = sizeof buf - 1;
-        for (size_t i = 0; i < base_len; i++)
-            buf[i] = ascii_lower(base[i]);
-        buf[base_len] = '\0';
-
-        for (const auto& glob : s->disabled) {
-            if (glob_match(buf, glob.c_str())) {
-                if (s->verbose) {
-                    Wh_Log(L"handler: '%S' matched disabled '%S' -> false", buf, glob.c_str());
-                }
-                return false;
-            }
-        }
-        if (previous_check)
-            return true;
-        for (const auto& glob : s->enabled) {
-            if (glob_match(buf, glob.c_str())) {
-                if (s->verbose) {
-                    Wh_Log(L"handler: '%S' matched enabled '%S' -> true", buf, glob.c_str());
-                }
-                return true;
-            }
-        }
-        return false;
+        result = EvaluateForegroundProcess(name, length, previous_check);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         Wh_Log(L"handler: exception caught during evaluation, falling back to previous check");
-        return previous_check;
+        result = previous_check;
     }
+    g_in_flight.fetch_sub(1, std::memory_order_release);
+    return result;
 }
 
 // ===========================================================================
@@ -410,64 +449,157 @@ static inline unsigned reg_of(uint8_t rex, unsigned field3, uint8_t rex_bit)
     return field3 | ((rex & rex_bit) ? 8u : 0u);
 }
 
-// lea r64, [base + disp] with the destination in the ModRM.reg field.
-// Rejects RIP-relative forms: the copy in the stub would resolve elsewhere.
-// Sets len and dest.
+// True if 'reg' is non-volatile under the Win64 ABI (RBX, RSP, RBP, RSI, RDI,
+// R12-R15). Any register read by our stub at the patch site must be non-volatile
+// so it survives the function calls in the comparison chain.
+static inline bool is_nonvolatile_reg(unsigned reg)
+{
+    return reg == 3 || reg == 4 || reg == 5 || reg == 6 || reg == 7 ||
+           (reg >= 12 && reg <= 15);
+}
+
+// Decodes a ModRM (+ optional SIB + displacement) memory operand that uses a
+// single base register with no index register and is not RIP-relative.
+// Returns the total byte length from the ModRM byte onward, or 0 on failure.
+static size_t DecodeBaseDispMem(uint8_t rex, const uint8_t* modrm_ptr, size_t avail,
+                                unsigned& base, int& disp, bool allow_disp32)
+{
+    if (avail < 1) return 0;
+    const uint8_t modrm = modrm_ptr[0];
+    const unsigned mod = modrm >> 6;
+    const unsigned rm  = modrm & 7;
+    if (mod == 3) return 0;                     // register form, not memory
+    if (mod == 0 && rm == 5) return 0;          // RIP-relative
+
+    size_t n = 1;
+    unsigned b = 0;
+    if (rm == 4) {                              // SIB present
+        if (avail < n + 1) return 0;
+        const uint8_t sib = modrm_ptr[n++];
+        if (((sib >> 3) & 7) != 4 || (rex & 0x02)) return 0; // index must be none
+        if ((sib >> 6) != 0) return 0;          // scale must be 1
+        if (mod == 0 && (sib & 7) == 5) return 0; // absolute disp32 without base
+        b = reg_of(rex, sib & 7, 0x01);
+    } else {
+        b = reg_of(rex, rm, 0x01);
+    }
+
+    int d = 0;
+    if (mod == 1) {
+        if (avail < n + 1) return 0;
+        d = static_cast<int8_t>(modrm_ptr[n++]);
+    } else if (mod == 2) {
+        if (!allow_disp32 || avail < n + 4) return 0;
+        int32_t d32 = 0;
+        std::memcpy(&d32, modrm_ptr + n, sizeof d32);
+        d = d32;
+        n += 4;
+    }
+
+    base = b;
+    disp = d;
+    return n;
+}
+
+// lea r64, [base + disp] with destination in ModRM.reg and a non-volatile base.
+// Rejects RIP-relative and indexed forms.
 static bool DecodeLea(const uint8_t* p, size_t avail, size_t& len, unsigned& dest)
 {
     if (avail < 3) return false;
     const uint8_t rex = p[0];
     if ((rex & 0xF8) != 0x48) return false;     // REX.W, optional R/X/B
     if (p[1] != 0x8D) return false;             // LEA
-    const uint8_t modrm = p[2];
-    const unsigned mod = modrm >> 6;
-    const unsigned rm  = modrm & 7;
-    if (mod == 3) return false;                 // register form is not a memory lea
-    if (mod == 0 && rm == 5) return false;      // RIP-relative
 
-    size_t n = 3;
-    if (rm == 4) {                              // SIB present
-        if (avail < n + 1) return false;
-        n += 1;
-    }
-    if (mod == 1)      n += 1;
-    else if (mod == 2) n += 4;
-    else if (mod == 0) { /* no displacement */ }
+    unsigned base = 0;
+    int disp = 0;
+    const size_t mem_len = DecodeBaseDispMem(rex, p + 2, avail - 2, base, disp, true);
+    if (mem_len == 0 || !is_nonvolatile_reg(base))
+        return false;
 
-    if (avail < n) return false;
-    len  = n;
-    dest = reg_of(rex, (modrm >> 3) & 7, 0x04); // REX.R
+    len  = 2 + mem_len;
+    dest = reg_of(rex, (p[2] >> 3) & 7, 0x04); // REX.R
     return true;
 }
 
-// cmp r64, imm8   ->  REX.W [+B] 83 /7 ib
-static bool DecodeCmpImm8(const uint8_t* p, size_t avail, unsigned& reg, int& imm)
+// cmp r64/r32, imm8   ->  [REX] 83 /7 ib
+// Used for the length pre-check before the comparison.
+static bool DecodeCmpRegImm8(const uint8_t* p, size_t avail, size_t& len,
+                             unsigned& reg, int& imm)
+{
+    size_t i = 0;
+    uint8_t rex = 0;
+    if (avail >= 4 && (p[0] & 0xF0) == 0x40) {
+        rex = p[0];
+        if ((rex & 0x06) != 0) return false;    // REX.R and REX.X must be 0
+        i = 1;
+    }
+    if (avail < i + 3) return false;
+    if (p[i] != 0x83) return false;
+    const uint8_t modrm = p[i + 1];
+    if ((modrm >> 6) != 3) return false;        // register operand
+    if (((modrm >> 3) & 7) != 7) return false;  // /7 = CMP
+    len = i + 3;
+    reg = reg_of(rex, modrm & 7, 0x01);         // REX.B
+    imm = static_cast<int8_t>(p[i + 2]);
+    return true;
+}
+
+// Decodes the SSO capacity check: cmp <nonvol_reg_or_frame_mem>, imm8 (15 or 16).
+static bool DecodeSsoCmpImm8(const uint8_t* p, size_t avail, size_t& len, int& imm)
 {
     if (avail < 4) return false;
     const uint8_t rex = p[0];
-    if ((rex & 0xFE) != 0x48) return false;     // 48 or 49
+    if ((rex & 0xF8) != 0x48) return false;     // REX.W required for capacity check
     if (p[1] != 0x83) return false;
     const uint8_t modrm = p[2];
-    if ((modrm >> 6) != 3) return false;        // register operand
     if (((modrm >> 3) & 7) != 7) return false;  // /7 = CMP
-    reg = reg_of(rex, modrm & 7, 0x01);         // REX.B
-    imm = static_cast<int8_t>(p[3]);
+
+    if ((modrm >> 6) == 3) {
+        if ((rex & 0x06) != 0) return false;
+        const unsigned reg = reg_of(rex, modrm & 7, 0x01);
+        if (!is_nonvolatile_reg(reg)) return false;
+        imm = static_cast<int8_t>(p[3]);
+        len = 4;
+        return true;
+    }
+
+    unsigned base = 0;
+    int disp = 0;
+    const size_t mem_len = DecodeBaseDispMem(rex, p + 2, avail - 2, base, disp, true);
+    if (mem_len == 0 || avail < 2 + mem_len + 1 || !is_nonvolatile_reg(base))
+        return false;
+    imm = static_cast<int8_t>(p[2 + mem_len]);
+    len = 2 + mem_len + 1;
     return true;
 }
 
-// cmov<cc> r64, r64 with the destination in ModRM.reg.
-// Accepts the two conditions the agent has used across versions:
-//   0F 43 = CMOVAE/NB, 0F 47 = CMOVA/NBE.
-static bool DecodeCmovToReg(const uint8_t* p, size_t avail, unsigned& dest)
+// cmov<cc> r64, <nonvol_reg_or_frame_mem> with destination in ModRM.reg.
+// Accepts unsigned and signed greater/equal conditions:
+//   0F 43 = CMOVAE/NB, 0F 47 = CMOVA/NBE, 0F 4D = CMOVGE, 0F 4F = CMOVG.
+static bool DecodeSsoCmov(const uint8_t* p, size_t avail, size_t& len, unsigned& dest)
 {
     if (avail < 4) return false;
     const uint8_t rex = p[0];
     if ((rex & 0xF8) != 0x48) return false;
     if (p[1] != 0x0F) return false;
-    if (p[2] != 0x43 && p[2] != 0x47) return false;
+    const uint8_t cc = p[2];
+    if (cc != 0x43 && cc != 0x47 && cc != 0x4D && cc != 0x4F) return false;
     const uint8_t modrm = p[3];
-    if ((modrm >> 6) != 3) return false;
     dest = reg_of(rex, (modrm >> 3) & 7, 0x04);
+
+    if ((modrm >> 6) == 3) {
+        const unsigned src = reg_of(rex, modrm & 7, 0x01);
+        if (!is_nonvolatile_reg(src)) return false;
+        len = 4;
+        return true;
+    }
+
+    unsigned base = 0;
+    int disp = 0;
+    const size_t mem_len = DecodeBaseDispMem(rex, p + 3, avail - 3, base, disp, true);
+    if (mem_len == 0 || !is_nonvolatile_reg(base))
+        return false;
+    len = 3 + mem_len;
     return true;
 }
 
@@ -490,26 +622,11 @@ static bool DecodeStoreAl(const uint8_t* p, size_t avail, size_t& len,
     if ((modrm >> 6) != 1) return false;        // disp8 form
     if (((modrm >> 3) & 7) != 0) return false;  // source register must be AL
     if (rex & 0x04) return false;               // REX.R would make it r8b..r15b
-    const unsigned rm = modrm & 7;
 
-    size_t n = i + 2;
-    unsigned b;
-    if (rm == 4) {                              // SIB
-        if (avail < n + 1) return false;
-        const uint8_t sib = p[n];
-        if (((sib >> 3) & 7) != 4 || (rex & 0x02)) return false;  // no index register (REX.X must be 0)
-        if ((sib >> 6) != 0) return false;        // scale must be 1
-        b = reg_of(rex, sib & 7, 0x01);           // REX.B
-        n += 1;
-    } else {
-        b = reg_of(rex, rm, 0x01);
-    }
-    if (avail < n + 1) return false;
-    disp = static_cast<int8_t>(p[n]);
-    n += 1;
+    const size_t mem_len = DecodeBaseDispMem(rex, p + i + 1, avail - (i + 1), base, disp, false);
+    if (mem_len == 0) return false;
 
-    len  = n;
-    base = b;
+    len = i + 1 + mem_len;
     return true;
 }
 
@@ -524,26 +641,11 @@ static bool DecodeLoadReg(const uint8_t* p, size_t avail, size_t& len,
     if (p[1] != 0x8B) return false;
     const uint8_t modrm = p[2];
     if ((modrm >> 6) != 1) return false;        // disp8 form
-    const unsigned rm = modrm & 7;
 
-    size_t n = 3;
-    unsigned b;
-    if (rm == 4) {
-        if (avail < n + 1) return false;
-        const uint8_t sib = p[n];
-        if (((sib >> 3) & 7) != 4 || (rex & 0x02)) return false;  // no index register (REX.X must be 0)
-        if ((sib >> 6) != 0) return false;
-        b = reg_of(rex, sib & 7, 0x01);
-        n += 1;
-    } else {
-        b = reg_of(rex, rm, 0x01);
-    }
-    if (avail < n + 1) return false;
-    disp = static_cast<int8_t>(p[n]);
-    n += 1;
+    const size_t mem_len = DecodeBaseDispMem(rex, p + 2, avail - 2, base, disp, false);
+    if (mem_len == 0) return false;
 
-    len  = n;
-    base = b;
+    len = 2 + mem_len;
     return true;
 }
 
@@ -579,11 +681,8 @@ static bool ValidateHookSite(uint8_t* p, size_t avail, size_t& hook_len)
     if (d1 != 0x28 || d2 != 0x08)
         return false;                       // the offsets the agent uses
 
-    // Must be a non-volatile register: our stub sets up RCX (1), RDX (2),
-    // and R8 (8) for the handler call, and RAX (0), R9 (9), R10 (10), R11 (11)
-    // are volatile. A volatile base would be clobbered before being replayed in
-    // the epilogue.
-    if (b1 == 0 || b1 == 1 || b1 == 2 || b1 == 8 || b1 == 9 || b1 == 10 || b1 == 11)
+    // Must be a non-volatile register so it is not clobbered before the epilogue.
+    if (!is_nonvolatile_reg(b1))
         return false;
 
     const size_t total = l1 + l2;
@@ -610,21 +709,61 @@ static void LogBytesAround(uint8_t* p, const Section& sec, size_t before, size_t
     }
 }
 
+// Checks whether an instruction at 'q' loads the verified size argument into R8:
+//   1. mov r8/r8d, <len_reg>  (opcode 0x8B, destination in ModRM.reg)
+//   2. mov r8/r8d, <len_reg>  (opcode 0x89, destination in ModRM.rm)
+//   3. mov r8d, <anchor_len>  (41 B8 imm32, constant-propagated length)
+//   4. mov r8,  <anchor_len>  (49 C7 C0 imm32, constant-propagated length)
+static bool IsSizeArgLoadToR8(const uint8_t* q, size_t avail, unsigned len_reg, size_t anchor_len)
+{
+    if (avail >= 3) {
+        const uint8_t rex = q[0];
+        const uint8_t op  = q[1];
+        const uint8_t modrm = q[2];
+        if ((modrm >> 6) == 3) {
+            // Opcode 0x8B: MOV r64/r32, r/m64/32 -> dest in reg, src in rm
+            if (op == 0x8B && (rex == 0x4C || rex == 0x4D || rex == 0x44 || rex == 0x45)) {
+                const unsigned dst = reg_of(rex, (modrm >> 3) & 7, 0x04);
+                const unsigned src = reg_of(rex, modrm & 7, 0x01);
+                if (dst == 8 && src == len_reg)
+                    return true;
+            }
+            // Opcode 0x89: MOV r/m64/32, r64/32 -> dest in rm, src in reg
+            if (op == 0x89 && (rex == 0x49 || rex == 0x4D || rex == 0x41 || rex == 0x45)) {
+                const unsigned dst = reg_of(rex, modrm & 7, 0x01);
+                const unsigned src = reg_of(rex, (modrm >> 3) & 7, 0x04);
+                if (dst == 8 && src == len_reg)
+                    return true;
+            }
+        }
+    }
+    // Constant-propagated mov r8d, imm32 (41 B8 ib ib ib ib)
+    if (avail >= 6 && q[0] == 0x41 && q[1] == 0xB8) {
+        uint32_t imm32 = 0;
+        std::memcpy(&imm32, q + 2, sizeof imm32);
+        if (imm32 == anchor_len)
+            return true;
+    }
+    // Constant-propagated mov r8, imm32 (49 C7 C0 ib ib ib ib)
+    if (avail >= 7 && q[0] == 0x49 && q[1] == 0xC7 && q[2] == 0xC0) {
+        uint32_t imm32 = 0;
+        std::memcpy(&imm32, q + 3, sizeof imm32);
+        if (imm32 == anchor_len)
+            return true;
+    }
+    return false;
+}
+
 // Walks back from the anchor reference to the structure that precedes it and
 // fills in 'out'. Returns false if anything does not decode as expected.
-//
-// The length pre-check is searched for within a window rather than assumed to
-// sit at a fixed offset: what the compiler emits between the check and the
-// comparison setup is not fixed, and an earlier build of this file assumed an
-// order that the shipping agent does not use.
 static bool ResolveFromAnchorRef(uint8_t* lea_rdx, const Section& code, size_t anchor_len, Site& out)
 {
     // Shape being looked for, reading forward:
-    //   <lea rcx,[frame+disp]> <cmp reg,15|16> <cmov rcx,reg>   the SSO triple
-    //   <cmp len_reg, anchor_len>                               the length check
-    //   <jne ...>              -> target is the patch site
-    //   ... possibly a few instructions ...
-    //   <lea rdx, [rip -> anchor]>                              <- entry point
+    //   <lea rcx,[frame+disp]> <cmp reg/mem,15|16> <cmov rcx,reg/mem>  the SSO triple
+    //   <cmp len_reg, anchor_len>                                      the length check
+    //   <jne ...>              -> target leads to the patch site
+    //   ... argument setup (including mov r8, len_reg) ...
+    //   <lea rdx, [rip -> anchor]>                                     <- entry point
     constexpr size_t k_window = 48;   // how far back the length check may sit
 
     if (lea_rdx < code.base + k_window + 24)
@@ -632,24 +771,30 @@ static bool ResolveFromAnchorRef(uint8_t* lea_rdx, const Section& code, size_t a
 
     // Nearest match first: the length check is the last branch before the
     // comparison it guards.
-    for (size_t back = 6; back <= k_window; back++) {
+    for (size_t back = 5; back <= k_window; back++) {
         uint8_t* p_cmplen = lea_rdx - back;
 
+        size_t   cmp_len = 0;
         unsigned len_reg = 0;
-        int imm = 0;
-        if (!DecodeCmpImm8(p_cmplen, 4, len_reg, imm))
+        int      imm     = 0;
+        if (!DecodeCmpRegImm8(p_cmplen, back, cmp_len, len_reg, imm))
             continue;
         if (imm != static_cast<int>(anchor_len))
             continue;
+        if (!is_nonvolatile_reg(len_reg))
+            continue;
 
         // The branch that skips the comparison, in either encoding.
-        uint8_t* p_j = p_cmplen + 4;
+        uint8_t* p_j = p_cmplen + cmp_len;
+        if (p_j + 2 > lea_rdx)
+            continue;
+
         uint8_t* target = nullptr;
         size_t   j_len = 0;
         if (p_j[0] == 0x75) {                       // jne rel8
             target = p_j + 2 + static_cast<int8_t>(p_j[1]);
             j_len  = 2;
-        } else if (p_j[0] == 0x0F && p_j[1] == 0x85) {   // jne rel32
+        } else if (p_j + 6 <= lea_rdx && p_j[0] == 0x0F && p_j[1] == 0x85) { // jne rel32
             int32_t rel;
             std::memcpy(&rel, p_j + 2, sizeof rel);
             target = p_j + 6 + rel;
@@ -660,23 +805,14 @@ static bool ResolveFromAnchorRef(uint8_t* lea_rdx, const Section& code, size_t a
         if (p_j + j_len > lea_rdx)                  // the branch must precede us
             continue;
 
-        // The branch target is not the patch site itself.
-        //
-        // The agent chains several name comparisons. A failed length check
-        // jumps to the tail that produces the result -- typically the
-        // 'xor al, al' that means "no match" -- and the store follows a couple
-        // of instructions later, after the two result paths converge. In some
-        // builds the two coincide, in others they do not, so the store is
-        // searched for forward from the branch target rather than assumed to
-        // be at it.
+        // The branch target lands in the convergence tail that produces the
+        // boolean verdict and stores it.
         if (target < code.base || target >= code.base + code.size)
             continue;
 
         uint8_t* hook = nullptr;
         size_t   hook_len = 0;
         {
-            // Only the small result tail is scanned. Anything longer would
-            // risk latching onto an unrelated store.
             constexpr size_t k_tail = 16;
             uint8_t* limit = target + k_tail;
             if (limit > code.base + code.size)
@@ -695,63 +831,61 @@ static bool ResolveFromAnchorRef(uint8_t* lea_rdx, const Section& code, size_t a
         if (!hook)
             continue;
 
-        // The SSO triple ends where the length check begins. Its lea is
-        // between 4 and 8 bytes depending on the frame register, SIB byte,
-        // and whether a disp8 or disp32 (for larger stack frames) is used.
+        // The SSO triple ends where the length check begins. Scan backward for
+        // a valid (lea rcx -> cmp 15|16 -> cmov rcx) sequence landing exactly
+        // at p_cmplen.
         uint8_t* triple = nullptr;
         size_t   triple_len = 0;
-        for (size_t lea_len = 4; lea_len <= 8; lea_len++) {
-            uint8_t* cand = p_cmplen - (lea_len + 8);
-            if (cand < code.base)
+        for (size_t total_try = 11; total_try <= 24; total_try++) {
+            if (p_cmplen < code.base + total_try)
                 continue;
+            uint8_t* cand = p_cmplen - total_try;
 
-            size_t   got_len = 0;
+            size_t   lea_len = 0;
             unsigned lea_dst = 0;
-            if (!DecodeLea(cand, lea_len, got_len, lea_dst))
-                continue;
-            if (got_len != lea_len || lea_dst != 1)      // must load into RCX
+            if (!DecodeLea(cand, total_try, lea_len, lea_dst) || lea_dst != 1)
                 continue;
 
-            unsigned sso_reg = 0;
-            int sso_imm = 0;
-            if (!DecodeCmpImm8(cand + lea_len, 4, sso_reg, sso_imm))
+            size_t cmp_sso_len = 0;
+            int    sso_imm     = 0;
+            if (!DecodeSsoCmpImm8(cand + lea_len, total_try - lea_len, cmp_sso_len, sso_imm))
                 continue;
-            if (sso_imm != 15 && sso_imm != 16)          // the encodings seen
+            if (sso_imm != 15 && sso_imm != 16)
                 continue;
 
+            size_t   cmov_len = 0;
             unsigned cmov_dst = 0;
-            if (!DecodeCmovToReg(cand + lea_len + 4, 4, cmov_dst))
+            const size_t rem = total_try - lea_len - cmp_sso_len;
+            if (!DecodeSsoCmov(cand + lea_len + cmp_sso_len, rem, cmov_len, cmov_dst))
                 continue;
-            if (cmov_dst != 1)                           // must select into RCX
+            if (cmov_dst != 1 || lea_len + cmp_sso_len + cmov_len != total_try)
                 continue;
 
             triple     = cand;
-            triple_len = lea_len + 8;
+            triple_len = total_try;
             break;
         }
         if (!triple)
             continue;
 
-        // Required cross-check: between the branch and the anchor reference, the
-        // same register that was length-checked must be handed to the
-        // comparison as its size argument (R8 under the Win64 convention).
-        //
-        // This is what separates the real call site from any other comparison
-        // against the value anchor_len that happens to sit near an anchor reference.
-        // Its position is not fixed, so it is searched for rather than assumed,
-        // but its absence is fatal.
+        // Required cross-check: between the branch and the comparison call
+        // (either just before or immediately after lea_rdx), R8 must receive
+        // the verified length.
+        uint8_t* scan_end = lea_rdx + 14;
+        if (scan_end > code.base + code.size)
+            scan_end = code.base + code.size;
+
         bool size_arg_ok = false;
-        for (uint8_t* q = p_j + j_len; q + 3 <= lea_rdx; q++) {
-            const bool w64 = (q[0] == 0x4C || q[0] == 0x4D);   // mov r8, r64
-            const bool w32 = (q[0] == 0x44 || q[0] == 0x45);   // mov r8d, r32
-            if (!(w64 || w32) || q[1] != 0x8B)
+        for (uint8_t* q = p_j + j_len; q < scan_end; q++) {
+            if (q == lea_rdx) {
+                q += 6; // skip the 7-byte lea_rdx instruction (loop increments +1)
                 continue;
-            if ((q[2] >> 6) != 3)
-                continue;
-            if (((q[2] >> 3) & 7) != 0)                        // destination R8
-                continue;
-            const unsigned src = (q[2] & 7) | ((q[0] & 1) ? 8u : 0u);
-            if (src == len_reg) { size_arg_ok = true; break; }
+            }
+            const size_t avail = static_cast<size_t>(scan_end - q);
+            if (IsSizeArgLoadToR8(q, avail, len_reg, anchor_len)) {
+                size_arg_ok = true;
+                break;
+            }
         }
         if (!size_arg_ok)
             continue;
@@ -859,32 +993,26 @@ static bool DiscoverSite(const std::string& anchor, Site& out)
 // ===========================================================================
 // SECTION: codegen
 //
-// The stub is written into a page allocated within reach of a 32-bit relative
-// jump from the patch site. Layout:
+// The stub is split across two adjacent pages allocated within reach of a
+// 32-bit relative jump from the patch site:
 //
-//   [ control block ]  two flag bytes, written by LoadSettings
-//   [ data slots    ]  absolute addresses of the handler and the resume point
-//   [ code          ]  the stub proper
+//   Page 0 (PAGE_READWRITE):
+//     [ control block ]  two flag bytes, updated lock-free by LoadSettings
+//     [ data slots    ]  absolute addresses of the handler and resume point
 //
-// The flags and both addresses live in the same page as the code, so every
-// reference is a short RIP-relative displacement. Reaching back into this DLL
-// instead could exceed the 2 GB a disp32 can express.
+//   Page 1 (PAGE_EXECUTE_READ):
+//     [ code          ]  the generated relay stub
 //
-// Register discipline, in the order the stub runs:
-//   entry      - the agent's mid-function state; AL holds its own verdict
-//   bypass     - saves and restores RFLAGS; touches no register
-//   full path  - restores RSP first, so a copied RSP-relative lea is correct
-//   call       - RCX/RDX/R8/RAX are arguments and return; R9/R10/R11 and
-//                XMM0-XMM5 are saved because the agent may still need them
-//   epilogue   - replays the overwritten instructions, then resumes
+// Splitting data and code across adjacent pages achieves strict W^X compliance:
+// neither page is ever mapped PAGE_EXECUTE_READWRITE, and LoadSettings can
+// update the control flags directly without calling VirtualProtect at runtime.
 // ===========================================================================
 
 struct StubLayout {
-    static constexpr size_t off_veto    = 0;    // 1 byte
-    static constexpr size_t off_extra   = 1;    // 1 byte
-    static constexpr size_t off_handler = 8;    // 8 bytes, absolute
-    static constexpr size_t off_resume  = 16;   // 8 bytes, absolute
-    static constexpr size_t off_code    = 32;   // 16-byte aligned
+    static constexpr size_t off_veto    = 0;    // 1 byte  (Page 0, RW)
+    static constexpr size_t off_extra   = 1;    // 1 byte  (Page 0, RW)
+    static constexpr size_t off_handler = 8;    // 8 bytes (Page 0, RW)
+    static constexpr size_t off_resume  = 16;   // 8 bytes (Page 0, RW)
 };
 
 // Small append-only emitter over a fixed buffer.
@@ -908,29 +1036,27 @@ struct Emitter {
 };
 } // namespace
 
-// Builds the stub. 'stub' is the page base, 'site' the discovered structure.
+// Builds the stub. 'data_page' is Page 0 (RW), 'code_page' is Page 1 (written
+// while RW, then transitioned to RX before patching).
 // Returns the number of code bytes written, or 0 on failure.
-static size_t BuildStub(uint8_t* stub, size_t stub_cap, const Site& site)
+static size_t BuildStub(uint8_t* data_page, uint8_t* code_page, size_t page_size, const Site& site)
 {
-    if (stub_cap <= StubLayout::off_code)
-        return 0;
-
-    // Data slots first.
-    stub[StubLayout::off_veto]  = 0;
-    stub[StubLayout::off_extra] = 0;
+    // Data slots in Page 0.
+    data_page[StubLayout::off_veto]  = 0;
+    data_page[StubLayout::off_extra] = 0;
     void* handler = reinterpret_cast<void*>(&patched_switch_foreground_process_handler);
-    std::memcpy(stub + StubLayout::off_handler, &handler, sizeof handler);
-    std::memcpy(stub + StubLayout::off_resume,  &site.resume, sizeof site.resume);
+    std::memcpy(data_page + StubLayout::off_handler, &handler, sizeof handler);
+    std::memcpy(data_page + StubLayout::off_resume,  &site.resume, sizeof site.resume);
 
-    uint8_t* code = stub + StubLayout::off_code;
-    Emitter e(code, stub_cap - StubLayout::off_code);
+    Emitter e(code_page, page_size);
 
-    // Displacement from the end of a RIP-relative instruction to a data slot.
+    // Displacement from the end of a RIP-relative instruction in Page 1 to a
+    // data slot in Page 0.
     auto rip_to = [&](size_t slot_off, size_t insn_end_from_code) -> uint32_t {
         const intptr_t from = static_cast<intptr_t>(
-            reinterpret_cast<uintptr_t>(code) + insn_end_from_code);
+            reinterpret_cast<uintptr_t>(code_page) + insn_end_from_code);
         const intptr_t to = static_cast<intptr_t>(
-            reinterpret_cast<uintptr_t>(stub) + slot_off);
+            reinterpret_cast<uintptr_t>(data_page) + slot_off);
         return static_cast<uint32_t>(static_cast<int32_t>(to - from));
     };
 
@@ -995,6 +1121,9 @@ static size_t BuildStub(uint8_t* stub, size_t stub_cap, const Site& site)
     e.u8(0xFF); e.u8(0x15);
     e.u32(rip_to(StubLayout::off_handler, e.n + 4));
 
+    // Clean upper bits of RAX so EAX/RAX holds a canonical 0 or 1.
+    e.u8(0x0F); e.u8(0xB6); e.u8(0xC0);           // movzx eax, al
+
     for (unsigned i = 0; i < 6; i++) {            // movaps xmm(i), [rsp+32+16i]
         e.u8(0x0F); e.u8(0x28);
         e.u8(static_cast<uint8_t>(0x44 | (i << 3)));
@@ -1027,7 +1156,7 @@ static size_t BuildStub(uint8_t* stub, size_t stub_cap, const Site& site)
     auto fix32 = [&](size_t slot, size_t target) {
         const int32_t d = static_cast<int32_t>(
             static_cast<intptr_t>(target) - static_cast<intptr_t>(slot + 4));
-        std::memcpy(code + slot, &d, sizeof d);
+        std::memcpy(code_page + slot, &d, sizeof d);
     };
     fix32(fix_jnz,      lbl_veto);
     fix32(fix_je_extra, lbl_pass);
@@ -1049,20 +1178,20 @@ struct HookState {
     uint8_t* address  = nullptr;      // patch site inside the agent
     uint8_t  original[16] = {};       // bytes replaced by the jump
     size_t   length   = 0;
-    uint8_t* stub     = nullptr;      // allocated page
+    uint8_t* stub     = nullptr;      // allocated 2-page block (Page 0 RW, Page 1 RX)
 };
 
 static HookState g_hook;
 
-// Pointers into the stub's control block, so settings changes reach the flags
-// the generated code actually reads.
+// Pointers into the stub's RW control block (Page 0), so settings changes
+// reach the flags without needing VirtualProtect on the RX code page.
 static volatile uint8_t* g_veto_flag  = nullptr;
 static volatile uint8_t* g_extra_flag = nullptr;
 
-// Allocates an executable page within +/-2GB of target, so an E9 can reach it.
+// Allocates a 2-page block (initially PAGE_READWRITE) within +/-2GB of target.
 // Uses VirtualQuery to skip already-allocated blocks in large chunks rather than
 // blindly probing every page, and respects the 64 KB allocation granularity.
-static void* AllocatePageNearAddress(void* target)
+static void* AllocateStubPagesNearAddress(void* target, size_t alloc_size)
 {
     SYSTEM_INFO si;
     GetSystemInfo(&si);
@@ -1088,9 +1217,10 @@ static void* AllocatePageNearAddress(void* target)
 
         if (mbi.State == MEM_FREE) {
             uintptr_t alloc_addr = (reinterpret_cast<uintptr_t>(mbi.BaseAddress) + gran - 1) & ~(gran - 1);
-            if (alloc_addr < reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize && alloc_addr < max_addr) {
-                if (void* p = VirtualAlloc(reinterpret_cast<void*>(alloc_addr), si.dwPageSize,
-                                           MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE))
+            uintptr_t region_end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+            if (alloc_addr + alloc_size <= region_end && alloc_addr + alloc_size <= max_addr) {
+                if (void* p = VirtualAlloc(reinterpret_cast<void*>(alloc_addr), alloc_size,
+                                           MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE))
                     return p;
             }
         }
@@ -1110,9 +1240,11 @@ static void* AllocatePageNearAddress(void* target)
             uintptr_t region_end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
             if (region_end >= gran) {
                 uintptr_t alloc_addr = (region_end - gran) & ~(gran - 1);
-                if (alloc_addr >= reinterpret_cast<uintptr_t>(mbi.BaseAddress) && alloc_addr >= min_addr) {
-                    if (void* p = VirtualAlloc(reinterpret_cast<void*>(alloc_addr), si.dwPageSize,
-                                               MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE))
+                if (alloc_addr >= reinterpret_cast<uintptr_t>(mbi.BaseAddress) &&
+                    alloc_addr >= min_addr &&
+                    alloc_addr + alloc_size <= region_end) {
+                    if (void* p = VirtualAlloc(reinterpret_cast<void*>(alloc_addr), alloc_size,
+                                               MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE))
                         return p;
                 }
             }
@@ -1164,51 +1296,58 @@ static bool InstallHook(const std::string& anchor)
 
     SYSTEM_INFO si;
     GetSystemInfo(&si);
-    const size_t page = si.dwPageSize;
+    const size_t page = si.dwPageSize ? si.dwPageSize : 4096;
 
-    auto* stub = static_cast<uint8_t*>(AllocatePageNearAddress(site.hook));
+    auto* stub = static_cast<uint8_t*>(AllocateStubPagesNearAddress(site.hook, 2 * page));
     if (!stub) {
         Wh_Log(L"install: no page available within reach of the patch site");
         return false;
     }
 
-    const size_t code_len = BuildStub(stub, page, site);
+    uint8_t* data_page = stub;
+    uint8_t* code_page = stub + page;
+
+    const size_t code_len = BuildStub(data_page, code_page, page, site);
     if (code_len == 0) {
         Wh_Log(L"install: could not build the stub");
         VirtualFree(stub, 0, MEM_RELEASE);
         return false;
     }
-    Wh_Log(L"install: stub at %p, %zu bytes of code", stub, code_len);
+    Wh_Log(L"install: stub data at %p (RW), code at %p (RX, %zu bytes)", data_page, code_page, code_len);
 
     // Confirm the jump can actually reach before touching the agent.
-    const intptr_t delta =
-        (stub + StubLayout::off_code) - (site.hook + k_rel_jmp_size);
+    const intptr_t delta = code_page - (site.hook + k_rel_jmp_size);
     if (delta < INT32_MIN || delta > INT32_MAX) {
         Wh_Log(L"install: stub out of range (delta = %lld)", static_cast<long long>(delta));
         VirtualFree(stub, 0, MEM_RELEASE);
         return false;
     }
 
-    // Publish the flag pointers before the patch goes live, so the first call
-    // through the stub already sees the current settings.
-    g_veto_flag  = stub + StubLayout::off_veto;
-    g_extra_flag = stub + StubLayout::off_extra;
+    // Publish the flag pointers in Page 0 (RW) before the patch goes live, so
+    // the first call through the stub already sees the current settings.
+    g_veto_flag  = data_page + StubLayout::off_veto;
+    g_extra_flag = data_page + StubLayout::off_extra;
     if (const ModSettings* s = g_settings.load(std::memory_order_acquire)) {
-        *g_veto_flag  = s->disabled.empty() ? 0 : 1;
-        *g_extra_flag = s->enabled.empty()  ? 0 : 1;
+        *g_veto_flag  = (s->verbose || !s->disabled.empty()) ? 1 : 0;
+        *g_extra_flag = (s->verbose || !s->enabled.empty())  ? 1 : 0;
     }
 
-    // Transition the stub page from RWX to RX for W^X compliance.
+    // Transition Page 1 (code_page) from RW to RX for strict W^X compliance.
+    // Page 0 (data_page) remains PAGE_READWRITE.
     DWORD old_stub_protect = 0;
-    if (!VirtualProtect(stub, page, PAGE_EXECUTE_READ, &old_stub_protect)) {
-        Wh_Log(L"install: could not protect stub page as PAGE_EXECUTE_READ, error = %u", GetLastError());
+    if (!VirtualProtect(code_page, page, PAGE_EXECUTE_READ, &old_stub_protect)) {
+        Wh_Log(L"install: could not protect stub code page as PAGE_EXECUTE_READ, error = %u", GetLastError());
         VirtualFree(stub, 0, MEM_RELEASE);
         g_veto_flag = g_extra_flag = nullptr;
         return false;
     }
+    FlushInstructionCache(GetCurrentProcess(), code_page, page);
 
+    // Ensure at least 8 bytes are unprotected for InterlockedCompareExchange64,
+    // plus any trailing bytes when site.hook_len > 8.
+    const size_t protect_len = (site.hook_len > 8) ? site.hook_len : 8;
     DWORD old = 0;
-    if (!VirtualProtect(site.hook, site.hook_len, PAGE_EXECUTE_READWRITE, &old)) {
+    if (!VirtualProtect(site.hook, protect_len, PAGE_EXECUTE_READWRITE, &old)) {
         Wh_Log(L"install: VirtualProtect failed, error = %u", GetLastError());
         VirtualFree(stub, 0, MEM_RELEASE);
         g_veto_flag = g_extra_flag = nullptr;
@@ -1222,13 +1361,20 @@ static bool InstallHook(const std::string& anchor)
 
     const int32_t rel = static_cast<int32_t>(delta);
 
-    // Prepare 8-byte patch buffer for atomic 64-bit swap
+    // Prepare 8-byte atomic header (5-byte E9 rel32 + up to 3 NOPs).
     uint8_t patch_buf[8];
-    std::memcpy(patch_buf, site.hook, 8);
+    std::memcpy(patch_buf, site.hook, sizeof patch_buf);
     patch_buf[0] = 0xE9;
     std::memcpy(patch_buf + 1, &rel, sizeof rel);
-    for (size_t i = k_rel_jmp_size; i < site.hook_len; i++) {
+    const size_t atomic_nop_end = (site.hook_len < sizeof patch_buf) ? site.hook_len : sizeof patch_buf;
+    for (size_t i = k_rel_jmp_size; i < atomic_nop_end; i++) {
         patch_buf[i] = 0x90;
+    }
+
+    // If the overwritten instruction pair exceeds 8 bytes, NOP the trailing
+    // bytes after the 8-byte atomic window.
+    for (size_t i = sizeof patch_buf; i < site.hook_len; i++) {
+        site.hook[i] = 0x90;
     }
 
     uint64_t new_val = 0;
@@ -1242,9 +1388,8 @@ static bool InstallHook(const std::string& anchor)
     );
 
     DWORD tmp = 0;
-    VirtualProtect(site.hook, site.hook_len, old, &tmp);
-    FlushInstructionCache(GetCurrentProcess(), site.hook, site.hook_len);
-    FlushInstructionCache(GetCurrentProcess(), stub, page);
+    VirtualProtect(site.hook, protect_len, old, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), site.hook, protect_len);
 
     g_hook.active = true;
     Wh_Log(L"install: patch applied at %p", site.hook);
@@ -1257,11 +1402,21 @@ static void RemoveHook()
     if (!g_hook.active)
         return;
 
+    // Disarm the stub control flags first so any thread entering the stub while
+    // we unpatch takes the fast .pass bypass instead of calling into this DLL.
+    if (g_veto_flag && g_extra_flag) {
+        *g_veto_flag  = 0;
+        *g_extra_flag = 0;
+        MemoryBarrier();
+    }
+
+    const size_t protect_len = (g_hook.length > 8) ? g_hook.length : 8;
     DWORD old = 0;
-    if (VirtualProtect(g_hook.address, g_hook.length, PAGE_EXECUTE_READWRITE, &old)) {
+    if (VirtualProtect(g_hook.address, protect_len, PAGE_EXECUTE_READWRITE, &old)) {
         uint8_t restore_buf[8];
-        std::memcpy(restore_buf, g_hook.address, 8);
-        std::memcpy(restore_buf, g_hook.original, g_hook.length);
+        std::memcpy(restore_buf, g_hook.address, sizeof restore_buf);
+        const size_t atomic_restore_len = (g_hook.length < sizeof restore_buf) ? g_hook.length : sizeof restore_buf;
+        std::memcpy(restore_buf, g_hook.original, atomic_restore_len);
 
         uint64_t restore_val = 0;
         uint64_t current_val = 0;
@@ -1273,23 +1428,27 @@ static void RemoveHook()
             static_cast<LONG64>(current_val)
         );
 
+        for (size_t i = sizeof restore_buf; i < g_hook.length; i++) {
+            g_hook.address[i] = g_hook.original[i];
+        }
+
         DWORD tmp = 0;
-        VirtualProtect(g_hook.address, g_hook.length, old, &tmp);
-        FlushInstructionCache(GetCurrentProcess(), g_hook.address, g_hook.length);
+        VirtualProtect(g_hook.address, protect_len, old, &tmp);
+        FlushInstructionCache(GetCurrentProcess(), g_hook.address, protect_len);
         Wh_Log(L"remove: original bytes restored at %p", g_hook.address);
     } else {
         Wh_Log(L"remove: VirtualProtect failed, error = %u", GetLastError());
     }
 
-    // The stub page is deliberately not freed: another thread may still be
-    // executing inside it at this moment. One leaked page is the safe choice.
+    // The stub pages are deliberately not freed: another thread may still be
+    // executing the pass-through epilogue inside it at this moment.
     g_veto_flag  = nullptr;
     g_extra_flag = nullptr;
     g_hook.active = false;
 
     // Wait for any in-flight execution in the handler to finish before
-    // unhooking finishes, avoiding a crash when the DLL is unloaded.
-    for (int i = 0; i < 50 && g_in_flight.load(std::memory_order_acquire) > 0; i++) {
+    // unhooking completes, avoiding a crash when the DLL is unloaded.
+    for (int i = 0; i < 100 && g_in_flight.load(std::memory_order_acquire) > 0; i++) {
         Sleep(1);
     }
 }
@@ -1297,6 +1456,40 @@ static void RemoveHook()
 // ===========================================================================
 // SECTION: settings loader
 // ===========================================================================
+
+// Normalizes a user-configured executable pattern:
+//   1. Lowers ASCII characters.
+//   2. Trims leading/trailing whitespace and quotes.
+//   3. Strips any accidentally pasted directory path prefix.
+//   4. Appends ".exe" if neither an extension ('.') nor wildcards ('*', '?') are present.
+static std::string NormalizeAppPattern(PCWSTR raw)
+{
+    std::string s;
+    for (const wchar_t* p = raw; *p; p++) {
+        const wchar_t w = *p;
+        s += (w < 0x80) ? ascii_lower(static_cast<char>(w)) : '?';
+    }
+
+    const auto is_trim = [](char c) {
+        return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '"' || c == '\'';
+    };
+    while (!s.empty() && is_trim(s.front()))
+        s.erase(s.begin());
+    while (!s.empty() && is_trim(s.back()))
+        s.pop_back();
+
+    const size_t slash = s.find_last_of("\\/");
+    if (slash != std::string::npos)
+        s.erase(0, slash + 1);
+
+    if (!s.empty() &&
+        s.find('.') == std::string::npos &&
+        s.find('*') == std::string::npos &&
+        s.find('?') == std::string::npos) {
+        s += ".exe";
+    }
+    return s;
+}
 
 // Reads a Windhawk string array. Windhawk has no length key: iterate until an
 // empty string comes back. key_fmt must contain a single %d.
@@ -1309,11 +1502,7 @@ static std::vector<std::string> ReadStringArray(const wchar_t* key_fmt)
             Wh_FreeStringSetting(raw);
             break;
         }
-        std::string entry;
-        for (const wchar_t* p = raw; *p; p++) {
-            const wchar_t w = *p;
-            entry += (w < 0x80) ? ascii_lower(static_cast<char>(w)) : '?';
-        }
+        std::string entry = NormalizeAppPattern(raw);
         Wh_FreeStringSetting(raw);
         if (!entry.empty())
             out.emplace_back(std::move(entry));
@@ -1323,19 +1512,29 @@ static std::vector<std::string> ReadStringArray(const wchar_t* key_fmt)
 
 static std::string ReadAnchor()
 {
-    std::string anchor;
     PCWSTR raw = Wh_GetStringSetting(L"anchorString");
-    if (raw) {
-        for (const wchar_t* p = raw; *p; p++) {
-            const wchar_t w = *p;
-            if (w < 0x80)
-                anchor += ascii_lower(static_cast<char>(w));
-        }
-    }
+    std::string anchor = raw ? NormalizeAppPattern(raw) : std::string();
     Wh_FreeStringSetting(raw);
     if (anchor.empty())
         anchor = "firefox.exe";
     return anchor;
+}
+
+static void ReclaimRetiredSettings(bool force_all)
+{
+    if (g_retired_settings.empty())
+        return;
+    if (!force_all && g_in_flight.load(std::memory_order_acquire) > 0) {
+        for (int i = 0; i < 20 && g_in_flight.load(std::memory_order_acquire) > 0; i++) {
+            Sleep(1);
+        }
+        if (g_in_flight.load(std::memory_order_acquire) > 0)
+            return;
+    }
+    for (const ModSettings* old : g_retired_settings) {
+        delete old;
+    }
+    g_retired_settings.clear();
 }
 
 static void LoadSettings()
@@ -1352,23 +1551,27 @@ static void LoadSettings()
 
     const size_t n_enabled  = fresh->enabled.size();
     const size_t n_disabled = fresh->disabled.size();
+    const bool   verbose    = fresh->verbose;
 
-    // Publish atomically. The retired generation is intentionally leaked; see
-    // the note on g_settings.
-    g_settings.store(fresh, std::memory_order_release);
+    g_last_verbose_sig.store(0, std::memory_order_relaxed);
 
-    // Update the flags the stub reads, after the settings they describe.
-    // Temporarily unprotect the control block in the RX stub page for writing.
-    if (g_veto_flag && g_extra_flag) {
-        DWORD old_protect = 0;
-        if (VirtualProtect(const_cast<uint8_t*>(g_veto_flag), 2, PAGE_EXECUTE_READWRITE, &old_protect)) {
-            *g_veto_flag  = n_disabled ? 1 : 0;
-            *g_extra_flag = n_enabled  ? 1 : 0;
-            VirtualProtect(const_cast<uint8_t*>(g_veto_flag), 2, old_protect, &old_protect);
-        }
+    // Publish atomically and queue the previous generation for safe reclamation.
+    if (const ModSettings* old = g_settings.exchange(fresh, std::memory_order_acq_rel)) {
+        g_retired_settings.push_back(old);
     }
 
-    Wh_Log(L"settings: %zu enabled, %zu disabled, verbose = %d", n_enabled, n_disabled, fresh->verbose ? 1 : 0);
+    // Update the flags in the RW data page (Page 0). When verbose logging is
+    // enabled, both flags are set to 1 so the stub routes all evaluations
+    // through the handler for diagnostic logging.
+    if (g_veto_flag && g_extra_flag) {
+        *g_veto_flag  = (verbose || n_disabled > 0) ? 1 : 0;
+        *g_extra_flag = (verbose || n_enabled  > 0) ? 1 : 0;
+        MemoryBarrier();
+    }
+
+    ReclaimRetiredSettings(false);
+
+    Wh_Log(L"settings: %zu enabled, %zu disabled, verbose = %d", n_enabled, n_disabled, verbose ? 1 : 0);
 }
 
 // ===========================================================================
@@ -1377,7 +1580,7 @@ static void LoadSettings()
 
 BOOL Wh_ModInit()
 {
-    Wh_Log(L"init: experimental structural-discovery build starting");
+    Wh_Log(L"init: experimental structural-discovery build starting (v3.0.0-exp7)");
     LoadSettings();
     return InstallHook(ReadAnchor()) ? TRUE : FALSE;
 }
@@ -1392,10 +1595,10 @@ void Wh_ModBeforeUninit()
     Wh_Log(L"uninit: removing hook");
     RemoveHook();
 
-    // Clean up settings to avoid leaking memory on unload.
-    if (const ModSettings* s = g_settings.exchange(nullptr)) {
-        delete s;
+    if (const ModSettings* s = g_settings.exchange(nullptr, std::memory_order_acq_rel)) {
+        g_retired_settings.push_back(s);
     }
+    ReclaimRetiredSettings(true);
 }
 
 void Wh_ModSettingsChanged()
