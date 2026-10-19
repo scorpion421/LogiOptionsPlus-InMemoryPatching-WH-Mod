@@ -299,13 +299,20 @@ static inline bool ShouldLogVerbose(const char* name, uint8_t outcome) noexcept
     return prev != h;
 }
 
-// Separated from the SEH wrapper so no C++ objects with destructors coexist
-// in the same stack frame as __try / __except under Clang (-fms-extensions).
-static bool EvaluateForegroundProcess(
+extern "C" bool patched_switch_foreground_process_handler(
     const char* name, size_t length, bool previous_check) noexcept
 {
+    g_in_flight.fetch_add(1, std::memory_order_acquire);
+    struct InFlightGuard {
+        ~InFlightGuard() noexcept {
+            g_in_flight.fetch_sub(1, std::memory_order_release);
+        }
+    } guard;
+
     const ModSettings* s = g_settings.load(std::memory_order_acquire);
-    if (!s || !name)
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(name);
+    // Validate canonical Win64 user-space pointer range and sane path length.
+    if (!s || addr < 0x10000ULL || addr > 0x00007FFFFFFFFFFFULL || length == 0 || length > 32768)
         return previous_check;   // never worse than the agent's own answer
 
     const bool have_disabled = !s->disabled.empty();
@@ -363,22 +370,6 @@ static bool EvaluateForegroundProcess(
         Wh_Log(L"handler: '%S' did not match any rule -> false", buf);
     }
     return false;
-}
-
-extern "C" bool patched_switch_foreground_process_handler(
-    const char* name, size_t length, bool previous_check) noexcept
-{
-    g_in_flight.fetch_add(1, std::memory_order_acquire);
-    bool result = previous_check;
-    __try {
-        result = EvaluateForegroundProcess(name, length, previous_check);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        Wh_Log(L"handler: exception caught during evaluation, falling back to previous check");
-        result = previous_check;
-    }
-    g_in_flight.fetch_sub(1, std::memory_order_release);
-    return result;
 }
 
 // ===========================================================================
