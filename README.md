@@ -4,7 +4,7 @@
 [![Windhawk](https://img.shields.io/badge/Windhawk-mod-blue)](https://windhawk.net/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078D6?logo=windows&logoColor=white)](#compatibility)
 ![Architecture](https://img.shields.io/badge/arch-amd64-lightgrey)
-![Status](https://img.shields.io/badge/status-experimental%20(v3.0.0--exp7)-orange)
+![Status](https://img.shields.io/badge/status-experimental%20(v3.0.0--exp8)-orange)
 [![Stable build](https://img.shields.io/badge/stable%20build-main%20branch-brightgreen)](https://github.com/scorpion421/LogiOptionsPlus-InMemoryPatching-WH-Mod/tree/main)
 
 > **About this branch:** This is the next-generation **structural-discovery** build. While the [`main` branch](https://github.com/scorpion421/LogiOptionsPlus-InMemoryPatching-WH-Mod/tree/main) relies on hardcoded byte signatures extracted by hand for each Logi Options+ release, this build dynamically derives the patch site from code structure and generates its relay trampoline at runtime.
@@ -20,54 +20,60 @@
 | **Patch site detection** | Hardcoded byte signatures per version (1.00 - 1.94, 2.06) | **Dynamic structural discovery** via string cross-references (`firefox.exe`, `chrome.exe`, etc.) |
 | **Relay trampoline** | Hand-written assembly handlers per version | **Dynamic runtime codegen** assembled specifically for the host layout |
 | **Logi Options+ updates** | Breaks on new agent releases until signatures are hand-extracted | **Resilient to updates:** adapts automatically without code changes |
-| **Self-healing fallback** | None (silent failure if signature misses) | **Multi-anchor fallback chain** across 6 known browser signatures |
-| **Hook concurrency** | Standard byte-by-byte write | **Atomic 64-bit swap** (`InterlockedCompareExchange64`) with multi-byte tail handling |
+| **Self-healing fallback** | None (silent failure if signature misses) | **Multi-link fallback chain** across genuine `.rdata` browser anchors (`firefox.exe`, `chrome.exe`, `msedge.exe`, `iexplore.exe`) |
+| **Hook concurrency** | Standard byte-by-byte write | **Single-qword atomic swap** (`InterlockedCompareExchange64`) with safe `> 8`-byte epilogue replay |
 | **Memory security** | RWX relay pages | **True split-page W^X compliance** (`PAGE_READWRITE` data page + `PAGE_EXECUTE_READ` code page; zero RWX allocations) |
-| **Crash protection** | None | **SEH boundary** (`__try / __except`) isolated from C++ RAII catches invalid host pointers |
-| **Unload safety** | Immediate unhook | **Stub bypass disarm + active in-flight counter** with thread drain-wait before `FreeLibrary` |
+| **Pointer safety** | Basic null check | **Canonical Win64 pointer validation** (`0x10000` - `0x00007FFFFFFFFFFF` + length bounds, zero syscall overhead, MinGW `clang++` compatible) |
+| **Unload safety** | Immediate unhook | **Stub bypass disarm + active in-flight counter** with safe settings retention and thread drain-wait |
 | **Memory allocation** | Linear 4 KB probing | **64 KB-aligned `VirtualQuery` allocator** (instant startup, zero lag) |
-| **Configuration** | Enabled / Disabled apps | Normalized Enabled / Disabled apps + **Anchor string** + **Deduplicated verbose logging** |
+| **Configuration** | Enabled / Disabled apps | Normalized Enabled / Disabled apps (zero-overhead fast path active by default) + **Anchor string** + **Deduplicated verbose logging** |
 
 ---
 
 ## The problem
 
-Logitech mice feature high-resolution scroll wheels capable of pixel-smooth scrolling. However, Logi Options+ artificially restricts this behavior to a tiny list of hardcoded browser executables (primarily `chrome.exe` and `firefox.exe`). Every other application - including Chromium-based browsers like Vivaldi, Brave, Opera, Edge, as well as editors, PDF viewers, and productivity tools - is restricted to coarse 3-line notches.
+Logitech mice feature high-resolution scroll wheels capable of pixel-smooth scrolling. However, Logi Options+ artificially restricts this behavior to a tiny list of hardcoded browser executables (primarily `msedge.exe`, `chrome.exe`, `iexplore.exe`, and `firefox.exe`). Every other application - including Chromium-based browsers like Vivaldi, Brave, and Opera, as well as editors, PDF viewers, and productivity tools - is restricted to coarse 3-line notches.
 
 ---
 
 ## How structural discovery works
 
-Where the stable mod matches exact byte sequences, this build inspects instructions:
+Where the stable mod matches exact byte sequences, this build inspects instructions across every link of the `||` comparison chain:
 
 ```
 [ Read-Only Data (.rdata) ]
-  "firefox.exe" (or fallback anchor: chrome.exe, msedge.exe, etc.)
+  "firefox.exe" (or fallback anchor: chrome.exe, msedge.exe, iexplore.exe)
          |
          |  1. Locate anchor literal in .rdata
          v
 [ Executable Code (.text) ]
-  48 8D 15 [disp32]   ->   lea rdx, [rip+disp32]   (arg setup for browser comparison)
-         |
-         |  2. Scan backwards within a 48-byte window
-         v
-  48 8D 4C 24 30      ->   lea rcx, [rsp+disp]     \
-  48 83 FE 0F         ->   cmp rsi, 15              >  5. Extract Small String Optimization (SSO) triple
-  48 0F 43 CE         ->   cmovae rcx, rsi         /      (supports both register and stack-frame operands)
-  49 83 FE 0B         ->   cmp r14, 11 (anchor_len)   3. Discover length check & non-volatile length register
-  75 18               ->   jne .mismatch              4. Follow branch to result convergence
+  48 8D 4D 40           ->   lea rcx, [rbp+disp]     \   5. Isolate SSO triple (skipping any
+  (optional frame loads)                              >     interleaved non-volatile frame loads)
+  48 83 FE 0F           ->   cmp rsi, 15             |
+  48 0F 47 CF           ->   cmova rcx, rdi          /
+  48 83 FB 0A           ->   cmp rbx, anchor_len         3. Discover length check & non-volatile length register
+  75 13                 ->   jne .next_or_mismatch       4a. Terminal link: jne -> convergence tail
+  4C 8B C3              ->   mov r8, rbx                    (verified size arg load into R8)
+  48 8D 15 [disp32]     ->   lea rdx, [rip+disp32]       2. Reference anchor literal
+  E8 [rel32]            ->   call <compare>
+  85 C0                 ->   test eax, eax
+  74 6F                 ->   je .match_tail              4b. Intermediate link: je/jne -> convergence tail
         ...
-.mismatch:
-  30 C0               ->   xor al, al              (converges here: store result)
-  88 43 28            ->   mov [rbx+0x28], al      <- 6. THE PATCH SITE
-  48 8B 5B 08         ->   mov rbx, [rbx+0x08]
+.match_tail:
+  B0 01                 ->   mov al, 1
+  EB 02                 ->   jmp .store
+.next_or_mismatch:
+  32 C0                 ->   xor al, al              (converges here: store result)
+.store:
+  41 88 46 28           ->   mov [r14+0x28], al      <- 6. THE PATCH SITE
+  49 8B 7E 08           ->   mov rdi, [r14+0x08]
 ```
 
 1. **Locate anchor string:** Finds the null-terminated string literal in the main module's read-only data sections (`.rdata`).
 2. **Find code reference:** Finds a RIP-relative `lea rdx, [rip+disp32]` in `.text` referencing the anchor.
 3. **Trace length check:** Scans backward to identify `cmp <reg>, anchor_len` (64-bit or 32-bit) followed by a `jne`, confirming the same non-volatile register (or constant-propagated anchor length) is passed as the comparison size argument in `R8`.
-4. **Follow branch target:** Follows the branch to the convergence point where the match/mismatch paths store the boolean verdict.
-5. **Extract pointer setup:** Decodes the preceding Small String Optimization (SSO) triple (`lea rcx` / `cmp` / `cmov rcx`) across both register and stack-memory forms, verifying all referenced registers are non-volatile.
+4. **Follow terminal or match target:** Follows the `jne` branch for the terminal link in the chain, or the post-call `je`/`jne` match branch (`test eax, eax` / `test al, al`) for earlier links, landing in the convergence tail.
+5. **Extract pointer setup:** Decodes the preceding Small String Optimization (SSO) triple (`lea rcx` / `cmp` / `cmov rcx`) across both register and stack-memory forms, isolating just those three instructions even when the compiler interleaves non-volatile frame register preloads, and verifies all referenced registers are non-volatile.
 6. **Patch site validation:** Validates the target store (`mov [base+0x28], al`) and subsequent load (`mov reg, [base+0x08]`), ensuring `base` is a non-volatile register.
 
 ---
@@ -77,10 +83,10 @@ Where the stable mod matches exact byte sequences, this build inspects instructi
 Deriving a patch address at runtime requires strict safety rails to ensure stability:
 
 * **True split-page W^X memory protection:** The runtime trampoline uses two adjacent pages: Page 0 (`PAGE_READWRITE`) holds the control flags and target pointers, while Page 1 is written as `PAGE_READWRITE` and transitioned once to `PAGE_EXECUTE_READ` (RX) before hook installation. `PAGE_EXECUTE_READWRITE` (RWX) is never requested at allocation or runtime, satisfying strict Windows Exploit Guard and ACG policies.
-* **Atomic 64-bit injection with multi-byte safety:** Hooks are written and removed using `InterlockedCompareExchange64` with explicit bounds handling when the overwritten instruction pair exceeds 8 bytes. Other threads in `logioptionsplus_agent.exe` never encounter partially-written instructions.
+* **Single-qword atomic injection:** Hooks are written and restored inside one single atomic 8-byte `InterlockedCompareExchange64` swap. Even on 10-byte (`R12`) instruction pairs, trailing bytes after offset `8` are never modified in place and are replayed cleanly from the stub before jumping past the pair, eliminating partial-instruction races.
 * **Strict non-volatile register verification:** All registers replayed at the patch site (`len_reg`, the `lea` frame base, and SSO `cmp`/`cmov` registers) are verified to be non-volatile under the Win64 ABI so they cannot be clobbered by intermediate function calls.
-* **Structured exception handling (SEH):** The decision handler is guarded by `__try / __except` in a dedicated wrapper separated from C++ RAII destructors. If Logi Options+ ever passes an invalid string pointer, the exception is caught safely and falls back to the native verdict.
-* **Bypass disarm and drain-wait on unload:** When the mod is disabled, `RemoveHook()` first zeroes the stub control flags so any newly arriving thread takes the fast bypass path, restores the original instructions atomically, and waits for all in-flight threads to exit before Windhawk unloads the DLL.
+* **Canonical Win64 pointer validation:** The decision handler validates that incoming name pointers reside in canonical Win64 user space (`0x10000` through `0x00007FFFFFFFFFFF`) with bounded path lengths before reading, requiring zero system calls on the hot path and compiling cleanly under Windhawk's MinGW `clang++` toolchain.
+* **Bypass disarm and lifetime retention on unload:** When the mod is disabled, the control flags are zeroed first so newly arriving threads take the fast bypass path, the original instructions are restored atomically, and retired settings generations are never freed while handler invocations remain in flight.
 * **Strict section filtering:** Writable sections (`IMAGE_SCN_MEM_WRITE`) are excluded from anchor searches to ensure only genuine `.rdata` string constants are matched.
 * **Single candidate rule:** If more than one candidate survives validation, discovery aborts rather than guesses.
 
@@ -102,8 +108,8 @@ Deriving a patch address at runtime requires strict safety rails to ensure stabi
 Settings can be customized directly in the Windhawk Mod Settings UI:
 
 * **Additional applications (`enabledApps`)**: Executable filenames (without path) to enable smooth scrolling for. Wildcards `*` and `?` are supported. Quotes, whitespace, and accidental directory paths are stripped automatically, and `.exe` is appended if omitted.
-* **Excluded applications (`disabledApps`)**: Executable filenames to explicitly disable smooth scrolling for. Overrides both the additional list and Logitech's built-in detection.
-* **Anchor string (`anchorString`)**: The literal used to locate the patch site (default: `firefox.exe`). Any valid browser string works.
+* **Excluded applications (`disabledApps`)**: Executable filenames to explicitly disable smooth scrolling for. Overrides both the additional list and Logitech's built-in detection. Empty by default so natively detected browsers run on the zero-overhead pass-through stub path without invoking C++.
+* **Anchor string (`anchorString`)**: The literal used to locate the patch site (default: `firefox.exe`; `chrome.exe`, `msedge.exe`, and `iexplore.exe` are also supported and tried automatically as fallbacks). Editing this setting automatically retries hook installation if startup discovery failed.
 * **Verbose logging (`verboseLogging`)**: When enabled (`true`), logs every distinct window evaluation outcome (disabled match, built-in detection, enabled match, and unmatched) with burst deduplication to the Windhawk log. Keep disabled (`false`) for normal use.
 
 ### Priority order
@@ -117,18 +123,25 @@ Settings can be customized directly in the Windhawk Mod Settings UI:
 
 ## Changelog
 
+### Version 3.0.0-exp8
+* **Multi-link chain discovery:** Resolved both intermediate (`je`/`jne` after `call`) and final (`jne` on length check) browser comparison links across authentic fallback anchors (`firefox.exe`, `chrome.exe`, `msedge.exe`, `iexplore.exe`), cleanly isolating SSO instructions even when frame preloads are interleaved in the first link.
+* **Fast-path activation out of the box:** Removed the legacy `iexplore.exe` default from `disabledApps` so natively detected browsers run on the zero-overhead pass-through stub path by default.
+* **Single-qword atomic patching:** Kept patch installation and removal strictly inside a single atomic 8-byte `InterlockedCompareExchange64` swap without touching trailing bytes on 10-byte (`R12`) hook sites.
+* **Unload and anchor retry hardening:** Avoided deleting retired settings if any handler thread remains active during unload, and automatically retried hook installation on settings changes when startup discovery failed.
+* **Toolchain and documentation cleanup:** Removed the obsolete `-fms-extensions` compiler flag and aligned safety documentation with canonical Win64 pointer validation.
+
 ### Version 3.0.0-exp7
 * **True W^X split-page stub:** Allocated separate `PAGE_READWRITE` data and `PAGE_EXECUTE_READ` code pages for the runtime stub, completely eliminating `PAGE_EXECUTE_READWRITE` (RWX) allocations and runtime `VirtualProtect` flips during settings reloads.
 * **Multi-byte patch buffer fix:** Fixed a stack buffer overflow in `InstallHook` and `RemoveHook` when `site.hook_len > 8`, while preserving atomic 64-bit `InterlockedCompareExchange64` patching for the jump header.
 * **Future-proof instruction decoding:** Added support for 32-bit length comparisons, `0x89` register moves, constant-propagated `mov r8d, <anchor_len>` immediates, memory-operand SSO checks (`cmp`/`cmov` on stack frame), and signed `cmov` variants (`CMOVGE`/`CMOVG`).
 * **Strict non-volatile register validation:** Verified that `len_reg`, the `lea` frame base, and all SSO `cmp`/`cmov` source registers are non-volatile under the Win64 ABI so they cannot be clobbered before reaching the patch site.
-* **Safe settings reclamation and unload bypass:** Reclaimed retired `ModSettings` generations once in-flight calls drain, separated C++ RAII from SEH `__try / __except`, and zeroed stub control flags prior to unpatching.
+* **Safe settings reclamation and unload bypass:** Reclaimed retired `ModSettings` generations once in-flight calls drain, replaced MSVC-only SEH with canonical Win64 user-space pointer and length validation for MinGW `clang++` compatibility, and zeroed stub control flags prior to unpatching.
 * **Input normalization and complete verbose logging:** Normalized user app entries (trimming quotes/whitespace, stripping accidental paths, appending `.exe` when omitted) and logged all foreground evaluation outcomes with deduplication when `verboseLogging` is active.
 
 ### Version 3.0.0-exp6
 * **W^X memory protection:** Stub page transitions to `PAGE_EXECUTE_READ` (RX) after assembly; prevents persistent RWX pages.
 * **Atomic 64-bit hook injection:** Patches applied and reverted atomically via `InterlockedCompareExchange64`, eliminating race conditions during hook installation and unhooking.
-* **Auto multi-anchor fallback:** Added automatic discovery fallback across known browser anchors (`chrome.exe`, `msedge.exe`, `brave.exe`, `opera.exe`, `vivaldi.exe`) if the primary anchor fails.
+* **Auto multi-anchor fallback:** Added automatic discovery fallback across known browser anchors if the primary anchor fails.
 * **Structured exception handling (SEH):** Wrapped decision handler in `__try / __except` to prevent host crashes if uninitialized string pointers are passed.
 * **Configurable verbose logging:** Added `verboseLogging` setting to suppress log spam during routine window switching.
 

@@ -5,6 +5,20 @@ All notable changes to this project (including the experimental structural-disco
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0-exp8] - 2026-11-22
+
+### Added
+- **Multi-link chain discovery:** Resolved both intermediate and final browser comparison links across multi-anchor fallbacks (`firefox.exe`, `chrome.exe`, `msedge.exe`, `iexplore.exe`), isolating SSO pointer instructions cleanly even when the first link interleaves non-volatile frame register preloads.
+- **Automatic hook retry on settings save:** Retried site discovery and hook installation automatically when settings change if startup discovery failed.
+
+### Changed
+- **Zero-overhead fast path out of the box:** Cleared the legacy `iexplore.exe` entry from default `disabledApps` so natively detected browsers immediately take the pass-through stub path unless exclusions are explicitly added.
+- **Authentic fallback chain and clean toolchain:** Aligned fallback anchors with genuine `.rdata` browser literals (`firefox.exe`, `chrome.exe`, `msedge.exe`, `iexplore.exe`) and removed the obsolete `-fms-extensions` compiler flag.
+
+### Fixed
+- **Single-qword atomic patching:** Kept patch writes and restores strictly inside a single atomic 8-byte `InterlockedCompareExchange64` swap, eliminating partial-instruction races on 10-byte (`R12`) hook sites.
+- **Safe settings lifetime and aligned docs:** Refused forced deletion of retired settings while handler calls remain in flight at unload, and updated documentation to describe canonical Win64 pointer validation rather than MSVC-only SEH.
+
 ## [3.0.0-exp7] - 2026-10-19
 
 ### Added
@@ -15,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Multi-byte patch buffer overflow:** Fixed a stack buffer overflow in `InstallHook` and `RemoveHook` when `site.hook_len > 8`, while preserving atomic 64-bit `InterlockedCompareExchange64` patching for the jump header and ensuring `VirtualProtect` covers at least 8 bytes.
-- **Safe settings reclamation and unload bypass:** Reclaimed retired `ModSettings` generations once in-flight calls drain, separated C++ RAII from SEH `__try / __except`, and zeroed stub control flags prior to unpatching.
+- **Safe settings reclamation and unload bypass:** Reclaimed retired `ModSettings` generations once in-flight calls drain, replaced MSVC-only SEH with canonical Win64 user-space pointer and length validation for MinGW `clang++` compatibility, and zeroed stub control flags prior to unpatching.
 
 ## [3.0.0-exp6] - 2026-10-18
 

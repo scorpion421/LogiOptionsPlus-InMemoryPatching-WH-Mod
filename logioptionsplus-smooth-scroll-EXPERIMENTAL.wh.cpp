@@ -2,12 +2,11 @@
 // @id              logioptionsplus-smooth-scroll-experimental
 // @name            Logi Options+ Smooth Scroll for All Apps (experimental)
 // @description     Structural-discovery build. Locates the patch site by string cross-reference instead of hardcoded signatures, and generates its trampoline at runtime.
-// @version         3.0.0-exp7
+// @version         3.0.0-exp8
 // @author          MickyFoley
 // @github          https://github.com/scorpion421
 // @include         logioptionsplus_agent.exe
 // @architecture    amd64
-// @compilerOptions -fms-extensions
 // @license         MIT
 // ==/WindhawkMod==
 
@@ -35,33 +34,38 @@ This build derives the patch site from the structure of the code instead.
 
 ## How it works
 
-1. Locate the literal `firefox.exe` in the agent's read-only data.
+1. Locate a known browser literal (default `firefox.exe`, or an automatic
+   fallback anchor) in the agent's read-only data.
 2. Scan the agent's code for a RIP-relative `lea rdx, [rip+disp32]` that resolves
    to that literal. This is the argument setup for the comparison against the
    browser name.
 3. Before it, find the length pre-check the compiler emits ahead of the
-   comparison: `cmp <reg>, 11` followed by a `jne`, with the same register handed
-   to the comparison as its size argument. Eleven is the length of
-   `firefox.exe`. The agent chains several such comparisons; the anchor's own
-   length selects the right link.
-4. Follow the `jne`. It lands in the tail that produces the result, and the
-   store of that result sits at or just after it, once the matching and
-   non-matching paths converge. That store is the patch site.
+   comparison: `cmp <reg>, <anchor_len>` followed by a `jne`, with the same
+   register (or constant-propagated immediate) handed to `r8` as the size
+   argument. The agent chains several such comparisons (`msedge.exe`,
+   `chrome.exe`, `iexplore.exe`, `firefox.exe`); the anchor's own length selects
+   the right link.
+4. Locate the verdict convergence tail: for the final link in the chain, the
+   length-mismatch `jne` jumps straight to the tail; for earlier links, the
+   post-call match branch (`je`/`jne` after `test eax, eax` or `test al, al`)
+   jumps to the convergence tail where the boolean verdict is stored.
 5. Before the length check sits the small-string-optimization triple
    (`lea rcx, [frame+disp]` / `cmp <reg_or_mem>, 15 or 16` / `cmov rcx, <reg_or_mem>`)
-   that produces the pointer to the name.
+   that produces the pointer to the name, cleanly extracted even when the
+   compiler interleaves non-volatile frame register preloads in the first link.
 
-Nothing above depends on exact byte values. Displacements, register allocation
-and the encodings of the SSO check all vary across the known agent versions,
-and all are decoded rather than matched.
+Nothing above depends on exact byte values. Displacements, register allocation,
+chain position, and the encodings of the SSO check all vary across agent
+versions, and all are decoded rather than matched.
 
 ## Runtime trampoline
 
-The relay stub is assembled at runtime from what discovery found: the SSO triple
-is copied verbatim, the length register is encoded into a `mov rdx`, and the
-instructions being overwritten are copied out before the patch is applied and
-replayed inside the stub. One generic path replaces the six hand-written
-assembly handlers, so a new agent version costs no code.
+The relay stub is assembled at runtime from what discovery found: the isolated
+SSO triple instructions are copied into the stub, the length register is
+encoded into a `mov rdx`, and the instructions being overwritten are copied out
+before the patch is applied and replayed inside the stub. One generic path
+replaces the six hand-written assembly handlers, so a new agent version costs
+no code.
 
 ## Safety
 
@@ -72,16 +76,17 @@ written:
 
 - the string is in a read-only section of the main module, the code in an
   executable one,
-- the length check, the `jne` and the `mov r8` decode exactly as expected, and
-  the length check and the `mov r8` name the same non-volatile register (or use
-  constant propagation of the verified anchor length),
+- the length check, the `jne`, and the `r8` size argument decode exactly as
+  expected, and both the terminal length-mismatch branch and any intermediate
+  post-call match branch are validated inside the same executable section,
 - the SSO triple decodes to `lea` into RCX and `cmov` into RCX using only
-  non-volatile registers,
-- the `jne` target lies inside the same executable section,
-- within a short window at that target there is exactly `mov [<base>+0x28], al`
+  non-volatile registers, isolating those three instructions even when frame
+  register preloads are interleaved,
+- within a short window at the convergence target there is `mov [<base>+0x28], al`
   followed by `mov <reg>, [<base>+0x8]`, both through the same non-volatile base
   register,
-- the overwritten range is at least 5 bytes, so an `E9` fits,
+- the overwritten range is at least 5 bytes so an `E9` fits, while patching on
+  disk stays inside a single atomic 8-byte compare-exchange swap,
 - and exactly one candidate survives. Ambiguity aborts.
 
 If anything fails, the mod does nothing and says why in the log. When an anchor
@@ -101,12 +106,10 @@ six known agent layouts (1.00 through 2.06), with no version knowledge supplied:
 - eleven deliberately corrupted variants (wrong compared length, mismatched
   registers, altered branch, wrong store target or offset, and others) were all
   refused rather than patched,
-- and, most importantly, against the actual instruction bytes captured from a
-  shipping agent (2.06). There the anchor is the second link in a chain of name
-  comparisons, and the branch after its length check lands two instructions
-  short of the patch site. Discovery selects the correct link and the correct
-  site, and the stub it generates is identical to the hand-written handler for
-  that version.
+- and against shipping Logi Options+ binaries (2.06 through 2.9.994631), all
+  four browser anchors (`firefox.exe`, `chrome.exe`, `msedge.exe`,
+  `iexplore.exe`) independently resolve to the exact same patch site and SSO
+  setup.
 
 RFLAGS are preserved exactly on the pass-through path. On the deciding path they
 are clobbered, as they were in every previous version and upstream: two code
@@ -114,20 +117,27 @@ paths converge at the patch site, so nothing downstream can depend on them.
 
 ## Changelog
 
+### 3.0.0-exp8
+- **Multi-link chain discovery:** Resolved both intermediate and final browser comparison links across multi-anchor fallbacks (`firefox.exe`, `chrome.exe`, `msedge.exe`, `iexplore.exe`), including clean extraction of SSO instructions when the first link interleaves non-volatile frame preloads.
+- **Fast-path activation out of the box:** Removed the legacy `iexplore.exe` entry from default excluded applications so natively detected browsers immediately take the zero-overhead pass-through stub path unless exclusions are explicitly configured.
+- **Single-qword atomic patching:** Kept patch installation and removal strictly inside a single atomic 8-byte `InterlockedCompareExchange64` swap, eliminating partial-instruction tearing on 10-byte (`R12`) hook sites.
+- **Unload and anchor retry hardening:** Kept retired settings alive if a handler invocation is still running at unload, and automatically retried hook installation on settings saves when startup discovery did not succeed.
+- **Toolchain and documentation cleanup:** Removed the obsolete `-fms-extensions` compiler flag and aligned safety documentation with canonical Win64 pointer validation.
+
 ### 3.0.0-exp7
-- **True W^X Split-Page Stub:** Allocated separate `PAGE_READWRITE` data and `PAGE_EXECUTE_READ` code pages for the runtime stub, completely eliminating `PAGE_EXECUTE_READWRITE` (RWX) allocations and runtime `VirtualProtect` flips during settings reloads.
-- **Multi-Byte Patch Buffer Fix:** Fixed a stack buffer overflow in `InstallHook` and `RemoveHook` when `site.hook_len > 8`, while preserving atomic 64-bit `InterlockedCompareExchange64` patching for the jump header.
-- **Future-Proof Instruction Decoding:** Added support for 32-bit length comparisons, `0x89` register moves, constant-propagated `mov r8d, <anchor_len>` immediates, memory-operand SSO checks (`cmp`/`cmov` on stack frame), and signed `cmov` variants (`CMOVGE`/`CMOVG`).
-- **Strict Non-Volatile Register Validation:** Verified that `len_reg`, the `lea` frame base, and all SSO `cmp`/`cmov` source registers are non-volatile under the Win64 ABI so they cannot be clobbered before reaching the patch site.
-- **Safe Settings Reclamation & Unload Bypass:** Reclaimed retired `ModSettings` generations once in-flight calls drain, separated C++ RAII from SEH `__try / __except`, and zeroed stub control flags prior to unpatching.
-- **Input Normalization & Complete Verbose Logging:** Normalized user app entries (trimming quotes/whitespace, stripping accidental paths, appending `.exe` when omitted) and logged all foreground evaluation outcomes with deduplication when `verboseLogging` is active.
+- **True W^X split-page stub:** Allocated separate `PAGE_READWRITE` data and `PAGE_EXECUTE_READ` code pages for the runtime stub, completely eliminating `PAGE_EXECUTE_READWRITE` (RWX) allocations and runtime `VirtualProtect` flips during settings reloads.
+- **Multi-byte patch buffer fix:** Fixed a stack buffer overflow in `InstallHook` and `RemoveHook` when `site.hook_len > 8`, while preserving atomic 64-bit `InterlockedCompareExchange64` patching for the jump header.
+- **Future-proof instruction decoding:** Added support for 32-bit length comparisons, `0x89` register moves, constant-propagated `mov r8d, <anchor_len>` immediates, memory-operand SSO checks (`cmp`/`cmov` on stack frame), and signed `cmov` variants (`CMOVGE`/`CMOVG`).
+- **Strict non-volatile register validation:** Verified that `len_reg`, the `lea` frame base, and all SSO `cmp`/`cmov` source registers are non-volatile under the Win64 ABI so they cannot be clobbered before reaching the patch site.
+- **Safe settings reclamation and unload bypass:** Reclaimed retired `ModSettings` generations once in-flight calls drain, replaced MSVC-only SEH with canonical Win64 user-space pointer and length validation for MinGW `clang++` compatibility, and zeroed stub control flags prior to unpatching.
+- **Input normalization and complete verbose logging:** Normalized user app entries (trimming quotes/whitespace, stripping accidental paths, appending `.exe` when omitted) and logged all foreground evaluation outcomes with deduplication when `verboseLogging` is active.
 
 ### 3.0.0-exp6
-- **W^X Memory Protection:** Stub page transitions to `PAGE_EXECUTE_READ` (RX) after assembly; avoids persistent RWX pages.
-- **Atomic 64-bit Hook Injection:** Applied and reverted patch sites atomically via `InterlockedCompareExchange64`, eliminating race conditions during hook installation and unhooking.
-- **Auto Multi-Anchor Fallback:** Added automatic discovery fallback across known browser anchors (`chrome.exe`, `msedge.exe`, `brave.exe`, etc.) if the primary anchor fails.
-- **Structured Exception Handling (SEH):** Protected decision handler with `__try / __except` to prevent process crashes if host string pointers are invalid.
-- **Configurable Verbose Logging:** Added `verboseLogging` setting to keep the Windhawk log clean during normal window switching.
+- **W^X memory protection:** Stub page transitions to `PAGE_EXECUTE_READ` (RX) after assembly; avoids persistent RWX pages.
+- **Atomic 64-bit hook injection:** Patches applied and reverted atomically via `InterlockedCompareExchange64`, eliminating race conditions during hook installation and unhooking.
+- **Auto multi-anchor fallback:** Added automatic discovery fallback across known browser anchors if the primary anchor fails.
+- **Structured exception handling (SEH):** Protected decision handler with `__try / __except` to prevent process crashes if host string pointers are invalid.
+- **Configurable verbose logging:** Added `verboseLogging` setting to keep the Windhawk log clean during normal window switching.
 
 ### 3.0.0-exp5
 - **Dynamic anchor length:** Fixed an issue where changing `anchorString` to an identifier with a length other than 11 characters (e.g. `chrome.exe`) would fail discovery.
@@ -157,12 +167,12 @@ https://github.com/igvk/LogiOptionsPlus-InMemoryPatching by igvk (MIT License)
   $name: Additional applications
   $description: Executable filenames (without path) to enable smooth scrolling for. Wildcards * and ? are supported.
 - disabledApps:
-    - iexplore.exe
+    - ""
   $name: Excluded applications
   $description: Executable filenames to explicitly disable smooth scrolling for. Overrides both the additional apps list and the built-in Logi Options+ browser detection. Wildcards * and ? are supported.
 - anchorString: firefox.exe
   $name: Anchor string
-  $description: The browser name literal used to locate the patch site. Only change this if the log reports that the anchor was not found.
+  $description: The browser name literal used to locate the patch site (firefox.exe, chrome.exe, msedge.exe, and iexplore.exe are supported as automatic fallbacks). Only change this if the log reports that discovery failed.
 - verboseLogging: false
   $name: Verbose logging
   $description: Log every window match event to the Windhawk log. Useful for debugging pattern rules.
@@ -640,18 +650,42 @@ static bool DecodeLoadReg(const uint8_t* p, size_t avail, size_t& len,
     return true;
 }
 
+// mov <nonvol_r64>, [<nonvol_base> + disp8/disp32]  ->  REX.W[+R/B] 8B /r ...
+// Matches harmless non-volatile register preloads the compiler schedules inside
+// the first comparison link's SSO setup without clobbering RCX, RSP, or RFLAGS.
+static bool DecodeNonVolFrameLoad(const uint8_t* p, size_t avail, size_t& len)
+{
+    if (avail < 3) return false;
+    const uint8_t rex = p[0];
+    if ((rex & 0xF8) != 0x48) return false;
+    if (p[1] != 0x8B) return false;
+    const unsigned dst = reg_of(rex, (p[2] >> 3) & 7, 0x04);
+    if (dst == 1 || dst == 4 || !is_nonvolatile_reg(dst))
+        return false; // never clobber RCX (1) or RSP (4)
+
+    unsigned base = 0;
+    int disp = 0;
+    const size_t mem_len = DecodeBaseDispMem(rex, p + 2, avail - 2, base, disp, true);
+    if (mem_len == 0 || !is_nonvolatile_reg(base))
+        return false;
+
+    len = 2 + mem_len;
+    return true;
+}
+
 // ===========================================================================
 // SECTION: discovery
 // ===========================================================================
 
 // Everything the code generator needs, derived from the agent's own code.
 struct Site {
-    uint8_t* triple      = nullptr;  // start of the lea/cmp/cmov sequence
-    size_t   triple_len  = 0;        // bytes to copy verbatim into the stub
-    unsigned len_reg     = 0;        // register holding the name length
-    uint8_t* hook        = nullptr;  // where the E9 goes
-    size_t   hook_len    = 0;        // bytes the E9 overwrites
-    uint8_t* resume      = nullptr;  // hook + hook_len
+    uint8_t* triple_addr      = nullptr; // start address of the SSO sequence in host
+    uint8_t  triple_bytes[24] = {};      // packed lea + cmp + cmov bytes for the stub
+    size_t   triple_len       = 0;       // valid byte count in triple_bytes
+    unsigned len_reg          = 0;       // non-volatile register holding name length
+    uint8_t* hook             = nullptr; // patch site address
+    size_t   hook_len         = 0;       // total byte length of the overwritten pair
+    uint8_t* resume           = nullptr; // hook + hook_len
 };
 
 // Validates the patch site itself: the two instructions being overwritten.
@@ -705,7 +739,8 @@ static void LogBytesAround(uint8_t* p, const Section& sec, size_t before, size_t
 //   2. mov r8/r8d, <len_reg>  (opcode 0x89, destination in ModRM.rm)
 //   3. mov r8d, <anchor_len>  (41 B8 imm32, constant-propagated length)
 //   4. mov r8,  <anchor_len>  (49 C7 C0 imm32, constant-propagated length)
-static bool IsSizeArgLoadToR8(const uint8_t* q, size_t avail, unsigned len_reg, size_t anchor_len)
+// Returns the instruction length in bytes, or 0 if not a match.
+static size_t MatchSizeArgLoadToR8(const uint8_t* q, size_t avail, unsigned len_reg, size_t anchor_len)
 {
     if (avail >= 3) {
         const uint8_t rex = q[0];
@@ -717,14 +752,14 @@ static bool IsSizeArgLoadToR8(const uint8_t* q, size_t avail, unsigned len_reg, 
                 const unsigned dst = reg_of(rex, (modrm >> 3) & 7, 0x04);
                 const unsigned src = reg_of(rex, modrm & 7, 0x01);
                 if (dst == 8 && src == len_reg)
-                    return true;
+                    return 3;
             }
             // Opcode 0x89: MOV r/m64/32, r64/32 -> dest in rm, src in reg
             if (op == 0x89 && (rex == 0x49 || rex == 0x4D || rex == 0x41 || rex == 0x45)) {
                 const unsigned dst = reg_of(rex, modrm & 7, 0x01);
                 const unsigned src = reg_of(rex, (modrm >> 3) & 7, 0x04);
                 if (dst == 8 && src == len_reg)
-                    return true;
+                    return 3;
             }
         }
     }
@@ -733,14 +768,176 @@ static bool IsSizeArgLoadToR8(const uint8_t* q, size_t avail, unsigned len_reg, 
         uint32_t imm32 = 0;
         std::memcpy(&imm32, q + 2, sizeof imm32);
         if (imm32 == anchor_len)
-            return true;
+            return 6;
     }
     // Constant-propagated mov r8, imm32 (49 C7 C0 ib ib ib ib)
     if (avail >= 7 && q[0] == 0x49 && q[1] == 0xC7 && q[2] == 0xC0) {
         uint32_t imm32 = 0;
         std::memcpy(&imm32, q + 3, sizeof imm32);
         if (imm32 == anchor_len)
+            return 7;
+    }
+    return 0;
+}
+
+// Scans a short tail window starting at 'target' for a valid patch site.
+static bool FindHookInTail(uint8_t* target, const Section& code, uint8_t*& hook, size_t& hook_len)
+{
+    if (target < code.base || target >= code.base + code.size)
+        return false;
+
+    constexpr size_t k_tail = 16;
+    uint8_t* sec_end = code.base + code.size;
+    uint8_t* limit = (static_cast<size_t>(sec_end - target) < k_tail) ? sec_end : target + k_tail;
+
+    for (uint8_t* q = target; q < limit; q++) {
+        const size_t avail = static_cast<size_t>(sec_end - q);
+        size_t len = 0;
+        if (ValidateHookSite(q, avail, len)) {
+            hook     = q;
+            hook_len = len;
             return true;
+        }
+    }
+    return false;
+}
+
+// Resolves the positive-match branch target after an anchor comparison call.
+// Used for intermediate links in an '||' comparison chain where the length-
+// mismatch jne advances to the next link while a match jumps to the tail.
+static bool FindPostCallMatchTarget(uint8_t* lea_rdx, const Section& code, unsigned len_reg,
+                                    size_t anchor_len, uint8_t*& match_target)
+{
+    uint8_t* cur = lea_rdx + 7;
+    uint8_t* sec_end = code.base + code.size;
+    if (cur >= sec_end)
+        return false;
+
+    const size_t r8_len = MatchSizeArgLoadToR8(cur, static_cast<size_t>(sec_end - cur), len_reg, anchor_len);
+    if (r8_len > 0)
+        cur += r8_len;
+
+    size_t avail = static_cast<size_t>(sec_end - cur);
+    if (avail >= 5 && cur[0] == 0xE8) {                 // call rel32
+        cur += 5;
+    } else if (avail >= 6 && cur[0] == 0xFF && cur[1] == 0x15) { // call [rip+disp32]
+        cur += 6;
+    } else {
+        return false;
+    }
+
+    avail = static_cast<size_t>(sec_end - cur);
+    if (avail < 4)
+        return false;
+
+    bool match_on_zero = false;
+    if (cur[0] == 0x85 && cur[1] == 0xC0) {             // test eax, eax (0 == match)
+        match_on_zero = true;
+    } else if (cur[0] == 0x84 && cur[1] == 0xC0) {      // test al, al (nonzero == match)
+        match_on_zero = false;
+    } else {
+        return false;
+    }
+    cur += 2;
+    avail = static_cast<size_t>(sec_end - cur);
+
+    uint8_t* target = nullptr;
+    uint8_t* branch_end = nullptr;
+    const uint8_t rel8_op  = match_on_zero ? 0x74 : 0x75;
+    const uint8_t rel32_op = match_on_zero ? 0x84 : 0x85;
+
+    if (avail >= 2 && cur[0] == rel8_op) {
+        branch_end = cur + 2;
+        target = branch_end + static_cast<int8_t>(cur[1]);
+    } else if (avail >= 6 && cur[0] == 0x0F && cur[1] == rel32_op) {
+        int32_t rel = 0;
+        std::memcpy(&rel, cur + 2, sizeof rel);
+        branch_end = cur + 6;
+        target = branch_end + rel;
+    } else {
+        return false;
+    }
+
+    if (target <= branch_end || target < code.base || target >= sec_end)
+        return false;
+
+    match_target = target;
+    return true;
+}
+
+// Scans backward from p_cmplen for the SSO triple (lea rcx -> cmp 15|16 -> cmov rcx),
+// packing only those three instructions into out.triple_bytes while skipping harmless
+// interleaved non-volatile frame loads.
+static bool ExtractSsoTriple(uint8_t* p_cmplen, const Section& code, Site& out)
+{
+    for (size_t total_try = 11; total_try <= 40; total_try++) {
+        if (static_cast<size_t>(p_cmplen - code.base) < total_try)
+            break;
+
+        uint8_t* cand = p_cmplen - total_try;
+        uint8_t* cur  = cand;
+
+        size_t   lea_len = 0;
+        unsigned lea_dst = 0;
+        if (!DecodeLea(cur, static_cast<size_t>(p_cmplen - cur), lea_len, lea_dst) || lea_dst != 1)
+            continue;
+        uint8_t* lea_ptr = cur;
+        cur += lea_len;
+
+        for (int k = 0; k < 3; k++) {
+            size_t fl = 0;
+            if (DecodeNonVolFrameLoad(cur, static_cast<size_t>(p_cmplen - cur), fl))
+                cur += fl;
+            else
+                break;
+        }
+
+        size_t cmp_sso_len = 0;
+        int    sso_imm     = 0;
+        if (!DecodeSsoCmpImm8(cur, static_cast<size_t>(p_cmplen - cur), cmp_sso_len, sso_imm))
+            continue;
+        if (sso_imm != 15 && sso_imm != 16)
+            continue;
+        uint8_t* cmp_ptr = cur;
+        cur += cmp_sso_len;
+
+        for (int k = 0; k < 2; k++) {
+            size_t fl = 0;
+            if (DecodeNonVolFrameLoad(cur, static_cast<size_t>(p_cmplen - cur), fl))
+                cur += fl;
+            else
+                break;
+        }
+
+        size_t   cmov_len = 0;
+        unsigned cmov_dst = 0;
+        if (!DecodeSsoCmov(cur, static_cast<size_t>(p_cmplen - cur), cmov_len, cmov_dst))
+            continue;
+        if (cmov_dst != 1)
+            continue;
+        uint8_t* cmov_ptr = cur;
+        cur += cmov_len;
+
+        for (int k = 0; k < 3; k++) {
+            size_t fl = 0;
+            if (DecodeNonVolFrameLoad(cur, static_cast<size_t>(p_cmplen - cur), fl))
+                cur += fl;
+            else
+                break;
+        }
+
+        if (cur != p_cmplen)
+            continue;
+        const size_t packed_len = lea_len + cmp_sso_len + cmov_len;
+        if (packed_len > sizeof(out.triple_bytes))
+            continue;
+
+        std::memcpy(out.triple_bytes, lea_ptr, lea_len);
+        std::memcpy(out.triple_bytes + lea_len, cmp_ptr, cmp_sso_len);
+        std::memcpy(out.triple_bytes + lea_len + cmp_sso_len, cmov_ptr, cmov_len);
+        out.triple_addr = cand;
+        out.triple_len  = packed_len;
+        return true;
     }
     return false;
 }
@@ -752,17 +949,16 @@ static bool ResolveFromAnchorRef(uint8_t* lea_rdx, const Section& code, size_t a
     // Shape being looked for, reading forward:
     //   <lea rcx,[frame+disp]> <cmp reg/mem,15|16> <cmov rcx,reg/mem>  the SSO triple
     //   <cmp len_reg, anchor_len>                                      the length check
-    //   <jne ...>              -> target leads to the patch site
+    //   <jne ...>              -> terminal tail OR next link in chain
     //   ... argument setup (including mov r8, len_reg) ...
     //   <lea rdx, [rip -> anchor]>                                     <- entry point
     constexpr size_t k_window = 48;   // how far back the length check may sit
 
-    if (lea_rdx < code.base + k_window + 24)
-        return false;
-
     // Nearest match first: the length check is the last branch before the
     // comparison it guards.
     for (size_t back = 5; back <= k_window; back++) {
+        if (static_cast<size_t>(lea_rdx - code.base) < back)
+            break;
         uint8_t* p_cmplen = lea_rdx - back;
 
         size_t   cmp_len = 0;
@@ -796,68 +992,20 @@ static bool ResolveFromAnchorRef(uint8_t* lea_rdx, const Section& code, size_t a
         if (p_j + j_len > lea_rdx)                  // the branch must precede us
             continue;
 
-        // The branch target lands in the convergence tail that produces the
-        // boolean verdict and stores it.
         if (target < code.base || target >= code.base + code.size)
             continue;
 
+        // Terminal links reach the convergence tail on jne; intermediate links
+        // in an '||' chain reach it via the post-call match branch instead.
         uint8_t* hook = nullptr;
         size_t   hook_len = 0;
-        {
-            constexpr size_t k_tail = 16;
-            uint8_t* limit = target + k_tail;
-            if (limit > code.base + code.size)
-                limit = code.base + code.size;
-
-            for (uint8_t* q = target; q < limit; q++) {
-                const size_t avail = static_cast<size_t>((code.base + code.size) - q);
-                size_t len = 0;
-                if (ValidateHookSite(q, avail, len)) {
-                    hook     = q;
-                    hook_len = len;
-                    break;
-                }
+        if (!FindHookInTail(target, code, hook, hook_len)) {
+            uint8_t* match_target = nullptr;
+            if (!FindPostCallMatchTarget(lea_rdx, code, len_reg, anchor_len, match_target) ||
+                !FindHookInTail(match_target, code, hook, hook_len)) {
+                continue;
             }
         }
-        if (!hook)
-            continue;
-
-        // The SSO triple ends where the length check begins. Scan backward for
-        // a valid (lea rcx -> cmp 15|16 -> cmov rcx) sequence landing exactly
-        // at p_cmplen.
-        uint8_t* triple = nullptr;
-        size_t   triple_len = 0;
-        for (size_t total_try = 11; total_try <= 24; total_try++) {
-            if (p_cmplen < code.base + total_try)
-                continue;
-            uint8_t* cand = p_cmplen - total_try;
-
-            size_t   lea_len = 0;
-            unsigned lea_dst = 0;
-            if (!DecodeLea(cand, total_try, lea_len, lea_dst) || lea_dst != 1)
-                continue;
-
-            size_t cmp_sso_len = 0;
-            int    sso_imm     = 0;
-            if (!DecodeSsoCmpImm8(cand + lea_len, total_try - lea_len, cmp_sso_len, sso_imm))
-                continue;
-            if (sso_imm != 15 && sso_imm != 16)
-                continue;
-
-            size_t   cmov_len = 0;
-            unsigned cmov_dst = 0;
-            const size_t rem = total_try - lea_len - cmp_sso_len;
-            if (!DecodeSsoCmov(cand + lea_len + cmp_sso_len, rem, cmov_len, cmov_dst))
-                continue;
-            if (cmov_dst != 1 || lea_len + cmp_sso_len + cmov_len != total_try)
-                continue;
-
-            triple     = cand;
-            triple_len = total_try;
-            break;
-        }
-        if (!triple)
-            continue;
 
         // Required cross-check: between the branch and the comparison call
         // (either just before or immediately after lea_rdx), R8 must receive
@@ -873,7 +1021,7 @@ static bool ResolveFromAnchorRef(uint8_t* lea_rdx, const Section& code, size_t a
                 continue;
             }
             const size_t avail = static_cast<size_t>(scan_end - q);
-            if (IsSizeArgLoadToR8(q, avail, len_reg, anchor_len)) {
+            if (MatchSizeArgLoadToR8(q, avail, len_reg, anchor_len) != 0) {
                 size_arg_ok = true;
                 break;
             }
@@ -881,12 +1029,15 @@ static bool ResolveFromAnchorRef(uint8_t* lea_rdx, const Section& code, size_t a
         if (!size_arg_ok)
             continue;
 
-        out.triple     = triple;
-        out.triple_len = triple_len;
-        out.len_reg    = len_reg;
-        out.hook       = hook;
-        out.hook_len   = hook_len;
-        out.resume     = hook + hook_len;
+        Site cand_site;
+        if (!ExtractSsoTriple(p_cmplen, code, cand_site))
+            continue;
+
+        cand_site.len_reg  = len_reg;
+        cand_site.hook     = hook;
+        cand_site.hook_len = hook_len;
+        cand_site.resume   = hook + hook_len;
+        out = cand_site;
         return true;
     }
 
@@ -977,7 +1128,7 @@ static bool DiscoverSite(const std::string& anchor, Site& out)
 
     out = hits[0];
     Wh_Log(L"discover: patch site %p, %zu bytes; setup %p, %zu bytes; length register r%u",
-           out.hook, out.hook_len, out.triple, out.triple_len, out.len_reg);
+           out.hook, out.hook_len, out.triple_addr, out.triple_len, out.len_reg);
     return true;
 }
 
@@ -1080,9 +1231,9 @@ static size_t BuildStub(uint8_t* data_page, uint8_t* code_page, size_t page_size
     const size_t lbl_full = e.n;
     e.u8(0x9D);                                   // popfq, restoring RSP
 
-    // The agent's own pointer setup, copied verbatim. RSP is back at its entry
-    // value, so an RSP-relative displacement inside it stays correct.
-    e.raw(site.triple, site.triple_len);          // -> RCX = name
+    // The agent's own pointer setup (isolated SSO triple). RSP is back at its
+    // entry value, so an RSP-relative displacement inside it stays correct.
+    e.raw(site.triple_bytes, site.triple_len);    // -> RCX = name
 
     // mov rdx, <len_reg>     REX.W [+R] 89 /r, ModRM.reg = source
     e.u8(static_cast<uint8_t>(0x48 | ((site.len_reg & 8) ? 0x04 : 0)));
@@ -1249,13 +1400,13 @@ static void* AllocateStubPagesNearAddress(void* target, size_t alloc_size)
     return nullptr;
 }
 
+static constexpr size_t k_atomic_patch_size = sizeof(uint64_t);
+
 static const char* const k_fallback_anchors[] = {
     "firefox.exe",
     "chrome.exe",
     "msedge.exe",
-    "brave.exe",
-    "opera.exe",
-    "vivaldi.exe",
+    "iexplore.exe",
 };
 
 // Discovers the site, builds the stub and applies the patch.
@@ -1334,11 +1485,11 @@ static bool InstallHook(const std::string& anchor)
     }
     FlushInstructionCache(GetCurrentProcess(), code_page, page);
 
-    // Ensure at least 8 bytes are unprotected for InterlockedCompareExchange64,
-    // plus any trailing bytes when site.hook_len > 8.
-    const size_t protect_len = (site.hook_len > 8) ? site.hook_len : 8;
+    // Patching stays strictly within a single atomic 8-byte compare-exchange
+    // swap. Trailing bytes when site.hook_len > 8 are skipped on entry by the
+    // E9 jump and skipped on exit because site.resume == site.hook + hook_len.
     DWORD old = 0;
-    if (!VirtualProtect(site.hook, protect_len, PAGE_EXECUTE_READWRITE, &old)) {
+    if (!VirtualProtect(site.hook, k_atomic_patch_size, PAGE_EXECUTE_READWRITE, &old)) {
         Wh_Log(L"install: VirtualProtect failed, error = %u", GetLastError());
         VirtualFree(stub, 0, MEM_RELEASE);
         g_veto_flag = g_extra_flag = nullptr;
@@ -1353,19 +1504,13 @@ static bool InstallHook(const std::string& anchor)
     const int32_t rel = static_cast<int32_t>(delta);
 
     // Prepare 8-byte atomic header (5-byte E9 rel32 + up to 3 NOPs).
-    uint8_t patch_buf[8];
+    uint8_t patch_buf[k_atomic_patch_size];
     std::memcpy(patch_buf, site.hook, sizeof patch_buf);
     patch_buf[0] = 0xE9;
     std::memcpy(patch_buf + 1, &rel, sizeof rel);
     const size_t atomic_nop_end = (site.hook_len < sizeof patch_buf) ? site.hook_len : sizeof patch_buf;
     for (size_t i = k_rel_jmp_size; i < atomic_nop_end; i++) {
         patch_buf[i] = 0x90;
-    }
-
-    // If the overwritten instruction pair exceeds 8 bytes, NOP the trailing
-    // bytes after the 8-byte atomic window.
-    for (size_t i = sizeof patch_buf; i < site.hook_len; i++) {
-        site.hook[i] = 0x90;
     }
 
     uint64_t new_val = 0;
@@ -1379,8 +1524,8 @@ static bool InstallHook(const std::string& anchor)
     );
 
     DWORD tmp = 0;
-    VirtualProtect(site.hook, protect_len, old, &tmp);
-    FlushInstructionCache(GetCurrentProcess(), site.hook, protect_len);
+    VirtualProtect(site.hook, k_atomic_patch_size, old, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), site.hook, k_atomic_patch_size);
 
     g_hook.active = true;
     Wh_Log(L"install: patch applied at %p", site.hook);
@@ -1401,10 +1546,9 @@ static void RemoveHook()
         MemoryBarrier();
     }
 
-    const size_t protect_len = (g_hook.length > 8) ? g_hook.length : 8;
     DWORD old = 0;
-    if (VirtualProtect(g_hook.address, protect_len, PAGE_EXECUTE_READWRITE, &old)) {
-        uint8_t restore_buf[8];
+    if (VirtualProtect(g_hook.address, k_atomic_patch_size, PAGE_EXECUTE_READWRITE, &old)) {
+        uint8_t restore_buf[k_atomic_patch_size];
         std::memcpy(restore_buf, g_hook.address, sizeof restore_buf);
         const size_t atomic_restore_len = (g_hook.length < sizeof restore_buf) ? g_hook.length : sizeof restore_buf;
         std::memcpy(restore_buf, g_hook.original, atomic_restore_len);
@@ -1419,13 +1563,9 @@ static void RemoveHook()
             static_cast<LONG64>(current_val)
         );
 
-        for (size_t i = sizeof restore_buf; i < g_hook.length; i++) {
-            g_hook.address[i] = g_hook.original[i];
-        }
-
         DWORD tmp = 0;
-        VirtualProtect(g_hook.address, protect_len, old, &tmp);
-        FlushInstructionCache(GetCurrentProcess(), g_hook.address, protect_len);
+        VirtualProtect(g_hook.address, k_atomic_patch_size, old, &tmp);
+        FlushInstructionCache(GetCurrentProcess(), g_hook.address, k_atomic_patch_size);
         Wh_Log(L"remove: original bytes restored at %p", g_hook.address);
     } else {
         Wh_Log(L"remove: VirtualProtect failed, error = %u", GetLastError());
@@ -1511,14 +1651,15 @@ static std::string ReadAnchor()
     return anchor;
 }
 
-static void ReclaimRetiredSettings(bool force_all)
+static void ReclaimRetiredSettings()
 {
     if (g_retired_settings.empty())
         return;
-    if (!force_all && g_in_flight.load(std::memory_order_acquire) > 0) {
+    if (g_in_flight.load(std::memory_order_acquire) > 0) {
         for (int i = 0; i < 20 && g_in_flight.load(std::memory_order_acquire) > 0; i++) {
             Sleep(1);
         }
+        // Never delete retired settings while a handler call is still running.
         if (g_in_flight.load(std::memory_order_acquire) > 0)
             return;
     }
@@ -1560,7 +1701,7 @@ static void LoadSettings()
         MemoryBarrier();
     }
 
-    ReclaimRetiredSettings(false);
+    ReclaimRetiredSettings();
 
     Wh_Log(L"settings: %zu enabled, %zu disabled, verbose = %d", n_enabled, n_disabled, verbose ? 1 : 0);
 }
@@ -1571,7 +1712,7 @@ static void LoadSettings()
 
 BOOL Wh_ModInit()
 {
-    Wh_Log(L"init: experimental structural-discovery build starting (v3.0.0-exp7)");
+    Wh_Log(L"init: experimental structural-discovery build starting (v3.0.0-exp8)");
     LoadSettings();
     return InstallHook(ReadAnchor()) ? TRUE : FALSE;
 }
@@ -1589,11 +1730,15 @@ void Wh_ModBeforeUninit()
     if (const ModSettings* s = g_settings.exchange(nullptr, std::memory_order_acq_rel)) {
         g_retired_settings.push_back(s);
     }
-    ReclaimRetiredSettings(true);
+    ReclaimRetiredSettings();
 }
 
 void Wh_ModSettingsChanged()
 {
     Wh_Log(L"settings: reloading");
     LoadSettings();
+    if (!g_hook.active) {
+        Wh_Log(L"settings: hook not active yet, retrying installation with updated anchor");
+        InstallHook(ReadAnchor());
+    }
 }
