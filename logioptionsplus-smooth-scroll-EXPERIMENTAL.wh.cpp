@@ -2,7 +2,7 @@
 // @id              logioptionsplus-smooth-scroll-experimental
 // @name            Logi Options+ Smooth Scroll for All Apps (experimental)
 // @description     Structural-discovery build. Locates the patch site by string cross-reference instead of hardcoded signatures, and generates its trampoline at runtime.
-// @version         3.0.0-exp8
+// @version         3.0.0-exp9
 // @author          MickyFoley
 // @github          https://github.com/scorpion421
 // @include         logioptionsplus_agent.exe
@@ -117,11 +117,17 @@ paths converge at the patch site, so nothing downstream can depend on them.
 
 ## Changelog
 
+### 3.0.0-exp9
+- **Stub-resident unload synchronization:** Moved the active call counter into the stub's permanently mapped data page (incremented before calling into the mod DLL and decremented after returning) and added a brief post-unpatch grace period, closing the unload race window during `FreeLibrary`.
+- **Blank-entry resilience in app lists:** Tolerated consecutive blank rows when reading Windhawk string arrays so leaving the default empty slot in `disabledApps` blank and adding entries below it no longer truncates the list.
+- **Compare-exchange conflict checks:** Verified the return value of `InterlockedCompareExchange64` during both hook installation and removal so concurrent modifications abort cleanly without clobbering third-party hooks.
+- **Clean init failure lifecycle:** Freed freshly allocated settings if startup discovery fails and removed the unreachable settings-change retry branch.
+
 ### 3.0.0-exp8
 - **Multi-link chain discovery:** Resolved both intermediate and final browser comparison links across multi-anchor fallbacks (`firefox.exe`, `chrome.exe`, `msedge.exe`, `iexplore.exe`), including clean extraction of SSO instructions when the first link interleaves non-volatile frame preloads.
 - **Fast-path activation out of the box:** Removed the legacy `iexplore.exe` entry from default excluded applications so natively detected browsers immediately take the zero-overhead pass-through stub path unless exclusions are explicitly configured.
 - **Single-qword atomic patching:** Kept patch installation and removal strictly inside a single atomic 8-byte `InterlockedCompareExchange64` swap, eliminating partial-instruction tearing on 10-byte (`R12`) hook sites.
-- **Unload and anchor retry hardening:** Kept retired settings alive if a handler invocation is still running at unload, and automatically retried hook installation on settings saves when startup discovery did not succeed.
+- **Unload hardening:** Kept retired settings alive if a handler invocation is still running at unload (the unreachable settings-change retry path added here was later cleaned up in `3.0.0-exp9`).
 - **Toolchain and documentation cleanup:** Removed the obsolete `-fms-extensions` compiler flag and aligned safety documentation with canonical Win64 pointer validation.
 
 ### 3.0.0-exp7
@@ -172,7 +178,7 @@ https://github.com/igvk/LogiOptionsPlus-InMemoryPatching by igvk (MIT License)
   $description: Executable filenames to explicitly disable smooth scrolling for. Overrides both the additional apps list and the built-in Logi Options+ browser detection. Wildcards * and ? are supported.
 - anchorString: firefox.exe
   $name: Anchor string
-  $description: The browser name literal used to locate the patch site (firefox.exe, chrome.exe, msedge.exe, and iexplore.exe are supported as automatic fallbacks). Only change this if the log reports that discovery failed.
+  $description: The browser name literal used to locate the patch site (firefox.exe, chrome.exe, msedge.exe, and iexplore.exe are supported as automatic fallbacks). Used on mod startup; only change this if the log reports that discovery failed.
 - verboseLogging: false
   $name: Verbose logging
   $description: Log every window match event to the Windhawk log. Useful for debugging pattern rules.
@@ -232,9 +238,15 @@ static std::atomic<const ModSettings*> g_settings{nullptr};
 // Retired settings waiting for in-flight handlers to finish before deletion.
 static std::vector<const ModSettings*> g_retired_settings;
 
-// Active invocations counter to prevent DLL unloading crashes during RemoveHook
-// and to allow safe reclamation of retired ModSettings instances.
-static std::atomic<int> g_in_flight{0};
+// Pointer to the 32-bit in-flight counter inside Page 0 (RW) of the stub.
+// Incremented by the stub immediately before calling into this DLL and
+// decremented after returning to the permanently mapped code page.
+static volatile LONG* g_stub_in_flight = nullptr;
+
+static inline LONG GetInFlightCount() noexcept
+{
+    return g_stub_in_flight ? InterlockedCompareExchange(g_stub_in_flight, 0, 0) : 0;
+}
 
 // Last verbose log signature to avoid flooding the log during fullscreen
 // transitions that emit bursts of identical foreground events.
@@ -312,13 +324,6 @@ static inline bool ShouldLogVerbose(const char* name, uint8_t outcome) noexcept
 extern "C" bool patched_switch_foreground_process_handler(
     const char* name, size_t length, bool previous_check) noexcept
 {
-    g_in_flight.fetch_add(1, std::memory_order_acquire);
-    struct InFlightGuard {
-        ~InFlightGuard() noexcept {
-            g_in_flight.fetch_sub(1, std::memory_order_release);
-        }
-    } guard;
-
     const ModSettings* s = g_settings.load(std::memory_order_acquire);
     const uintptr_t addr = reinterpret_cast<uintptr_t>(name);
     // Validate canonical Win64 user-space pointer range and sane path length.
@@ -722,8 +727,8 @@ static bool ValidateHookSite(uint8_t* p, size_t avail, size_t& hook_len)
 // understand can be read out of the log instead of guessed at.
 static void LogBytesAround(uint8_t* p, const Section& sec, size_t before, size_t after)
 {
-    uint8_t* lo = (p - before < sec.base) ? sec.base : p - before;
-    uint8_t* hi = (p + after > sec.base + sec.size) ? sec.base + sec.size : p + after;
+    uint8_t* lo = (static_cast<size_t>(p - sec.base) < before) ? sec.base : (p - before);
+    uint8_t* hi = (static_cast<size_t>((sec.base + sec.size) - p) < after) ? (sec.base + sec.size) : (p + after);
 
     for (uint8_t* line = lo; line < hi; line += 16) {
         wchar_t buf[128];
@@ -1151,10 +1156,11 @@ static bool DiscoverSite(const std::string& anchor, Site& out)
 // ===========================================================================
 
 struct StubLayout {
-    static constexpr size_t off_veto    = 0;    // 1 byte  (Page 0, RW)
-    static constexpr size_t off_extra   = 1;    // 1 byte  (Page 0, RW)
-    static constexpr size_t off_handler = 8;    // 8 bytes (Page 0, RW)
-    static constexpr size_t off_resume  = 16;   // 8 bytes (Page 0, RW)
+    static constexpr size_t off_veto      = 0;    // 1 byte  (Page 0, RW)
+    static constexpr size_t off_extra     = 1;    // 1 byte  (Page 0, RW)
+    static constexpr size_t off_handler   = 8;    // 8 bytes (Page 0, RW)
+    static constexpr size_t off_resume    = 16;   // 8 bytes (Page 0, RW)
+    static constexpr size_t off_in_flight = 24;   // 4 bytes (Page 0, RW)
 };
 
 // Small append-only emitter over a fixed buffer.
@@ -1189,6 +1195,8 @@ static size_t BuildStub(uint8_t* data_page, uint8_t* code_page, size_t page_size
     void* handler = reinterpret_cast<void*>(&patched_switch_foreground_process_handler);
     std::memcpy(data_page + StubLayout::off_handler, &handler, sizeof handler);
     std::memcpy(data_page + StubLayout::off_resume,  &site.resume, sizeof site.resume);
+    const int32_t zero_in_flight = 0;
+    std::memcpy(data_page + StubLayout::off_in_flight, &zero_in_flight, sizeof zero_in_flight);
 
     Emitter e(code_page, page_size);
 
@@ -1259,12 +1267,22 @@ static size_t BuildStub(uint8_t* data_page, uint8_t* code_page, size_t page_size
         e.u8(static_cast<uint8_t>(32 + 16 * i));
     }
 
+    // Track active DLL entry from inside the permanently mapped stub.
+    //   lock inc dword ptr [rip + off_in_flight]
+    e.u8(0xF0); e.u8(0xFF); e.u8(0x05);
+    e.u32(rip_to(StubLayout::off_in_flight, e.n + 4));
+
     // call [rip + handler]   -- indirect, so nothing extra is clobbered
     e.u8(0xFF); e.u8(0x15);
     e.u32(rip_to(StubLayout::off_handler, e.n + 4));
 
     // Clean upper bits of RAX so EAX/RAX holds a canonical 0 or 1.
     e.u8(0x0F); e.u8(0xB6); e.u8(0xC0);           // movzx eax, al
+
+    // Thread has returned out of the DLL into code_page; safe to decrement.
+    //   lock dec dword ptr [rip + off_in_flight]
+    e.u8(0xF0); e.u8(0xFF); e.u8(0x0D);
+    e.u32(rip_to(StubLayout::off_in_flight, e.n + 4));
 
     for (unsigned i = 0; i < 6; i++) {            // movaps xmm(i), [rsp+32+16i]
         e.u8(0x0F); e.u8(0x28);
@@ -1316,11 +1334,12 @@ static size_t BuildStub(uint8_t* data_page, uint8_t* code_page, size_t page_size
 static constexpr size_t k_rel_jmp_size = 1 + sizeof(int32_t);
 
 struct HookState {
-    bool     active   = false;
-    uint8_t* address  = nullptr;      // patch site inside the agent
-    uint8_t  original[16] = {};       // bytes replaced by the jump
-    size_t   length   = 0;
-    uint8_t* stub     = nullptr;      // allocated 2-page block (Page 0 RW, Page 1 RX)
+    bool     active        = false;
+    uint8_t* address       = nullptr;      // patch site inside the agent
+    uint8_t  original[16]  = {};           // bytes replaced by the jump
+    size_t   length        = 0;
+    uint64_t patched_qword = 0;            // expected 8-byte header written at InstallHook
+    uint8_t* stub          = nullptr;      // allocated 2-page block (Page 0 RW, Page 1 RX)
 };
 
 static HookState g_hook;
@@ -1465,10 +1484,11 @@ static bool InstallHook(const std::string& anchor)
         return false;
     }
 
-    // Publish the flag pointers in Page 0 (RW) before the patch goes live, so
-    // the first call through the stub already sees the current settings.
-    g_veto_flag  = data_page + StubLayout::off_veto;
-    g_extra_flag = data_page + StubLayout::off_extra;
+    // Publish the flag and in-flight counter pointers in Page 0 (RW) before
+    // the patch goes live, so the first call through the stub sees them.
+    g_veto_flag      = data_page + StubLayout::off_veto;
+    g_extra_flag     = data_page + StubLayout::off_extra;
+    g_stub_in_flight = reinterpret_cast<volatile LONG*>(data_page + StubLayout::off_in_flight);
     if (const ModSettings* s = g_settings.load(std::memory_order_acquire)) {
         *g_veto_flag  = (s->verbose || !s->disabled.empty()) ? 1 : 0;
         *g_extra_flag = (s->verbose || !s->enabled.empty())  ? 1 : 0;
@@ -1481,6 +1501,7 @@ static bool InstallHook(const std::string& anchor)
         Wh_Log(L"install: could not protect stub code page as PAGE_EXECUTE_READ, error = %u", GetLastError());
         VirtualFree(stub, 0, MEM_RELEASE);
         g_veto_flag = g_extra_flag = nullptr;
+        g_stub_in_flight = nullptr;
         return false;
     }
     FlushInstructionCache(GetCurrentProcess(), code_page, page);
@@ -1493,6 +1514,7 @@ static bool InstallHook(const std::string& anchor)
         Wh_Log(L"install: VirtualProtect failed, error = %u", GetLastError());
         VirtualFree(stub, 0, MEM_RELEASE);
         g_veto_flag = g_extra_flag = nullptr;
+        g_stub_in_flight = nullptr;
         return false;
     }
 
@@ -1517,7 +1539,7 @@ static bool InstallHook(const std::string& anchor)
     uint64_t old_val = 0;
     std::memcpy(&new_val, patch_buf, sizeof new_val);
     std::memcpy(&old_val, site.hook, sizeof old_val);
-    InterlockedCompareExchange64(
+    const LONG64 prev = InterlockedCompareExchange64(
         reinterpret_cast<volatile LONG64*>(site.hook),
         static_cast<LONG64>(new_val),
         static_cast<LONG64>(old_val)
@@ -1525,9 +1547,22 @@ static bool InstallHook(const std::string& anchor)
 
     DWORD tmp = 0;
     VirtualProtect(site.hook, k_atomic_patch_size, old, &tmp);
+    if (prev != static_cast<LONG64>(old_val)) {
+        Wh_Log(L"install: patch site %p changed concurrently (expected 0x%016llX, found 0x%016llX); aborting",
+               site.hook,
+               static_cast<unsigned long long>(old_val),
+               static_cast<unsigned long long>(static_cast<uint64_t>(prev)));
+        VirtualFree(stub, 0, MEM_RELEASE);
+        g_veto_flag      = nullptr;
+        g_extra_flag     = nullptr;
+        g_stub_in_flight = nullptr;
+        g_hook           = HookState{};
+        return false;
+    }
     FlushInstructionCache(GetCurrentProcess(), site.hook, k_atomic_patch_size);
 
-    g_hook.active = true;
+    g_hook.patched_qword = new_val;
+    g_hook.active        = true;
     Wh_Log(L"install: patch applied at %p", site.hook);
     return true;
 }
@@ -1549,37 +1584,45 @@ static void RemoveHook()
     DWORD old = 0;
     if (VirtualProtect(g_hook.address, k_atomic_patch_size, PAGE_EXECUTE_READWRITE, &old)) {
         uint8_t restore_buf[k_atomic_patch_size];
-        std::memcpy(restore_buf, g_hook.address, sizeof restore_buf);
+        std::memcpy(restore_buf, &g_hook.patched_qword, sizeof restore_buf);
         const size_t atomic_restore_len = (g_hook.length < sizeof restore_buf) ? g_hook.length : sizeof restore_buf;
         std::memcpy(restore_buf, g_hook.original, atomic_restore_len);
 
         uint64_t restore_val = 0;
-        uint64_t current_val = 0;
         std::memcpy(&restore_val, restore_buf, sizeof restore_val);
-        std::memcpy(&current_val, g_hook.address, sizeof current_val);
-        InterlockedCompareExchange64(
+        const LONG64 prev = InterlockedCompareExchange64(
             reinterpret_cast<volatile LONG64*>(g_hook.address),
             static_cast<LONG64>(restore_val),
-            static_cast<LONG64>(current_val)
+            static_cast<LONG64>(g_hook.patched_qword)
         );
 
         DWORD tmp = 0;
         VirtualProtect(g_hook.address, k_atomic_patch_size, old, &tmp);
-        FlushInstructionCache(GetCurrentProcess(), g_hook.address, k_atomic_patch_size);
-        Wh_Log(L"remove: original bytes restored at %p", g_hook.address);
+        if (prev == static_cast<LONG64>(g_hook.patched_qword)) {
+            FlushInstructionCache(GetCurrentProcess(), g_hook.address, k_atomic_patch_size);
+            Wh_Log(L"remove: original bytes restored at %p", g_hook.address);
+        } else {
+            Wh_Log(L"remove: patch site %p was modified externally (expected 0x%016llX, found 0x%016llX); skipped restore",
+                   g_hook.address,
+                   static_cast<unsigned long long>(g_hook.patched_qword),
+                   static_cast<unsigned long long>(static_cast<uint64_t>(prev)));
+        }
     } else {
         Wh_Log(L"remove: VirtualProtect failed, error = %u", GetLastError());
     }
 
     // The stub pages are deliberately not freed: another thread may still be
-    // executing the pass-through epilogue inside it at this moment.
-    g_veto_flag  = nullptr;
-    g_extra_flag = nullptr;
+    // executing the pass-through epilogue inside it at this moment. Keep
+    // g_stub_in_flight valid through Wh_ModBeforeUninit for settings reclamation.
+    g_veto_flag   = nullptr;
+    g_extra_flag  = nullptr;
     g_hook.active = false;
 
-    // Wait for any in-flight execution in the handler to finish before
-    // unhooking completes, avoiding a crash when the DLL is unloaded.
-    for (int i = 0; i < 100 && g_in_flight.load(std::memory_order_acquire) > 0; i++) {
+    // Grace period so any thread between reading control flags and executing
+    // 'lock inc' either finishes the fast .pass bypass or enters the counter,
+    // followed by draining until no thread remains inside this DLL.
+    Sleep(20);
+    for (int i = 0; i < 100 && GetInFlightCount() > 0; i++) {
         Sleep(1);
     }
 }
@@ -1622,17 +1665,23 @@ static std::string NormalizeAppPattern(PCWSTR raw)
     return s;
 }
 
-// Reads a Windhawk string array. Windhawk has no length key: iterate until an
-// empty string comes back. key_fmt must contain a single %d.
+// Reads a Windhawk string array. Windhawk has no length key and can persist
+// blank items ahead of populated ones, so stop only after several consecutive
+// empty entries. key_fmt must contain a single %d.
 static std::vector<std::string> ReadStringArray(const wchar_t* key_fmt)
 {
+    constexpr int k_max_empty_streak = 8;
     std::vector<std::string> out;
+    int empty_streak = 0;
     for (int i = 0; ; i++) {
         PCWSTR raw = Wh_GetStringSetting(key_fmt, i);
         if (!raw || raw[0] == L'\0') {
             Wh_FreeStringSetting(raw);
-            break;
+            if (++empty_streak >= k_max_empty_streak)
+                break;
+            continue;
         }
+        empty_streak = 0;
         std::string entry = NormalizeAppPattern(raw);
         Wh_FreeStringSetting(raw);
         if (!entry.empty())
@@ -1655,12 +1704,12 @@ static void ReclaimRetiredSettings()
 {
     if (g_retired_settings.empty())
         return;
-    if (g_in_flight.load(std::memory_order_acquire) > 0) {
-        for (int i = 0; i < 20 && g_in_flight.load(std::memory_order_acquire) > 0; i++) {
+    if (GetInFlightCount() > 0) {
+        for (int i = 0; i < 20 && GetInFlightCount() > 0; i++) {
             Sleep(1);
         }
         // Never delete retired settings while a handler call is still running.
-        if (g_in_flight.load(std::memory_order_acquire) > 0)
+        if (GetInFlightCount() > 0)
             return;
     }
     for (const ModSettings* old : g_retired_settings) {
@@ -1712,9 +1761,16 @@ static void LoadSettings()
 
 BOOL Wh_ModInit()
 {
-    Wh_Log(L"init: experimental structural-discovery build starting (v3.0.0-exp8)");
+    Wh_Log(L"init: experimental structural-discovery build starting (v3.0.0-exp9)");
     LoadSettings();
-    return InstallHook(ReadAnchor()) ? TRUE : FALSE;
+    if (!InstallHook(ReadAnchor())) {
+        if (const ModSettings* s = g_settings.exchange(nullptr, std::memory_order_acq_rel)) {
+            g_retired_settings.push_back(s);
+        }
+        ReclaimRetiredSettings();
+        return FALSE;
+    }
+    return TRUE;
 }
 
 void Wh_ModAfterInit()
@@ -1731,14 +1787,11 @@ void Wh_ModBeforeUninit()
         g_retired_settings.push_back(s);
     }
     ReclaimRetiredSettings();
+    g_stub_in_flight = nullptr;
 }
 
 void Wh_ModSettingsChanged()
 {
     Wh_Log(L"settings: reloading");
     LoadSettings();
-    if (!g_hook.active) {
-        Wh_Log(L"settings: hook not active yet, retrying installation with updated anchor");
-        InstallHook(ReadAnchor());
-    }
 }

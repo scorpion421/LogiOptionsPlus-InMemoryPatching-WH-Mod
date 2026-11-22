@@ -4,7 +4,7 @@
 [![Windhawk](https://img.shields.io/badge/Windhawk-mod-blue)](https://windhawk.net/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078D6?logo=windows&logoColor=white)](#compatibility)
 ![Architecture](https://img.shields.io/badge/arch-amd64-lightgrey)
-![Status](https://img.shields.io/badge/status-experimental%20(v3.0.0--exp8)-orange)
+![Status](https://img.shields.io/badge/status-experimental%20(v3.0.0--exp9)-orange)
 [![Stable build](https://img.shields.io/badge/stable%20build-main%20branch-brightgreen)](https://github.com/scorpion421/LogiOptionsPlus-InMemoryPatching-WH-Mod/tree/main)
 
 > **About this branch:** This is the next-generation **structural-discovery** build. While the [`main` branch](https://github.com/scorpion421/LogiOptionsPlus-InMemoryPatching-WH-Mod/tree/main) relies on hardcoded byte signatures extracted by hand for each Logi Options+ release, this build dynamically derives the patch site from code structure and generates its relay trampoline at runtime.
@@ -83,10 +83,10 @@ Where the stable mod matches exact byte sequences, this build inspects instructi
 Deriving a patch address at runtime requires strict safety rails to ensure stability:
 
 * **True split-page W^X memory protection:** The runtime trampoline uses two adjacent pages: Page 0 (`PAGE_READWRITE`) holds the control flags and target pointers, while Page 1 is written as `PAGE_READWRITE` and transitioned once to `PAGE_EXECUTE_READ` (RX) before hook installation. `PAGE_EXECUTE_READWRITE` (RWX) is never requested at allocation or runtime, satisfying strict Windows Exploit Guard and ACG policies.
-* **Single-qword atomic injection:** Hooks are written and restored inside one single atomic 8-byte `InterlockedCompareExchange64` swap. Even on 10-byte (`R12`) instruction pairs, trailing bytes after offset `8` are never modified in place and are replayed cleanly from the stub before jumping past the pair, eliminating partial-instruction races.
+* **Single-qword atomic injection with conflict checking:** Hooks are written and restored inside one single atomic 8-byte `InterlockedCompareExchange64` swap, verifying the prior 8-byte word on both install and unhook so concurrent modifications abort cleanly without clobbering third-party hooks. Even on 10-byte (`R12`) instruction pairs, trailing bytes after offset `8` are never modified in place and are replayed cleanly from the stub before jumping past the pair.
 * **Strict non-volatile register verification:** All registers replayed at the patch site (`len_reg`, the `lea` frame base, and SSO `cmp`/`cmov` registers) are verified to be non-volatile under the Win64 ABI so they cannot be clobbered by intermediate function calls.
 * **Canonical Win64 pointer validation:** The decision handler validates that incoming name pointers reside in canonical Win64 user space (`0x10000` through `0x00007FFFFFFFFFFF`) with bounded path lengths before reading, requiring zero system calls on the hot path and compiling cleanly under Windhawk's MinGW `clang++` toolchain.
-* **Bypass disarm and lifetime retention on unload:** When the mod is disabled, the control flags are zeroed first so newly arriving threads take the fast bypass path, the original instructions are restored atomically, and retired settings generations are never freed while handler invocations remain in flight.
+* **Stub-resident unload synchronization:** When the mod is disabled, the stub control flags are zeroed first so newly arriving threads take the fast bypass path, and the original instructions are restored atomically. An active invocation counter inside Page 0 of the permanently mapped stub is incremented before entering the mod DLL and decremented after returning to Page 1, paired with a brief post-unpatch grace period so `FreeLibrary` never unmaps code while an agent thread is executing inside it. Retired settings generations remain allocated while handler invocations remain in flight.
 * **Strict section filtering:** Writable sections (`IMAGE_SCN_MEM_WRITE`) are excluded from anchor searches to ensure only genuine `.rdata` string constants are matched.
 * **Single candidate rule:** If more than one candidate survives validation, discovery aborts rather than guesses.
 
@@ -107,9 +107,9 @@ Deriving a patch address at runtime requires strict safety rails to ensure stabi
 
 Settings can be customized directly in the Windhawk Mod Settings UI:
 
-* **Additional applications (`enabledApps`)**: Executable filenames (without path) to enable smooth scrolling for. Wildcards `*` and `?` are supported. Quotes, whitespace, and accidental directory paths are stripped automatically, and `.exe` is appended if omitted.
+* **Additional applications (`enabledApps`)**: Executable filenames (without path) to enable smooth scrolling for. Wildcards `*` and `?` are supported. Quotes, whitespace, and accidental directory paths are stripped automatically, `.exe` is appended if omitted, and blank rows left ahead of populated items are tolerated.
 * **Excluded applications (`disabledApps`)**: Executable filenames to explicitly disable smooth scrolling for. Overrides both the additional list and Logitech's built-in detection. Empty by default so natively detected browsers run on the zero-overhead pass-through stub path without invoking C++.
-* **Anchor string (`anchorString`)**: The literal used to locate the patch site (default: `firefox.exe`; `chrome.exe`, `msedge.exe`, and `iexplore.exe` are also supported and tried automatically as fallbacks). Editing this setting automatically retries hook installation if startup discovery failed.
+* **Anchor string (`anchorString`)**: The literal used on mod startup to locate the patch site (default: `firefox.exe`; `chrome.exe`, `msedge.exe`, and `iexplore.exe` are also supported and tried automatically as fallbacks). Only change this and re-enable the mod if the log reports that discovery failed.
 * **Verbose logging (`verboseLogging`)**: When enabled (`true`), logs every distinct window evaluation outcome (disabled match, built-in detection, enabled match, and unmatched) with burst deduplication to the Windhawk log. Keep disabled (`false`) for normal use.
 
 ### Priority order
@@ -123,11 +123,17 @@ Settings can be customized directly in the Windhawk Mod Settings UI:
 
 ## Changelog
 
+### Version 3.0.0-exp9
+* **Stub-resident unload synchronization:** Moved the active invocation counter into the runtime stub's permanently mapped data page (incremented right before calling into the mod DLL and decremented after returning) and added a post-unpatch grace period, closing the unload race window during `FreeLibrary`.
+* **Blank-entry resilience in app lists:** Tolerated consecutive blank rows when reading Windhawk string arrays so leaving the default empty slot in `disabledApps` blank while adding exclusions below it no longer truncates the list.
+* **Compare-exchange conflict checks:** Verified `InterlockedCompareExchange64` return values on both hook installation and removal so concurrent changes abort safely without clobbering external hooks.
+* **Clean init failure lifecycle:** Freed freshly loaded settings when startup discovery fails and removed the unreachable settings-change retry branch from `Wh_ModSettingsChanged`.
+
 ### Version 3.0.0-exp8
 * **Multi-link chain discovery:** Resolved both intermediate (`je`/`jne` after `call`) and final (`jne` on length check) browser comparison links across authentic fallback anchors (`firefox.exe`, `chrome.exe`, `msedge.exe`, `iexplore.exe`), cleanly isolating SSO instructions even when frame preloads are interleaved in the first link.
 * **Fast-path activation out of the box:** Removed the legacy `iexplore.exe` default from `disabledApps` so natively detected browsers run on the zero-overhead pass-through stub path by default.
 * **Single-qword atomic patching:** Kept patch installation and removal strictly inside a single atomic 8-byte `InterlockedCompareExchange64` swap without touching trailing bytes on 10-byte (`R12`) hook sites.
-* **Unload and anchor retry hardening:** Avoided deleting retired settings if any handler thread remains active during unload, and automatically retried hook installation on settings changes when startup discovery failed.
+* **Unload hardening:** Avoided deleting retired settings if any handler thread remains active during unload (the unreachable settings-change retry path added here was later cleaned up in `3.0.0-exp9`).
 * **Toolchain and documentation cleanup:** Removed the obsolete `-fms-extensions` compiler flag and aligned safety documentation with canonical Win64 pointer validation.
 
 ### Version 3.0.0-exp7

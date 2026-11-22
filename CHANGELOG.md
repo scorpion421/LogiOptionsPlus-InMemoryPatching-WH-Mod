@@ -5,11 +5,22 @@ All notable changes to this project (including the experimental structural-disco
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0-exp9] - 2026-11-22
+
+### Fixed
+- **Stub-resident unload synchronization:** Moved the active invocation counter into the runtime stub's permanently mapped data page (incremented right before entering the mod DLL and decremented immediately after returning) and added a post-unpatch grace period, closing the unload race window during `FreeLibrary`.
+- **Blank-entry resilience in app lists:** Tolerated consecutive blank rows when reading Windhawk string arrays so leaving the default empty slot in `disabledApps` blank while adding exclusions below it no longer truncates the list.
+- **Compare-exchange conflict checks:** Verified `InterlockedCompareExchange64` return values during both hook installation and removal so concurrent modifications abort cleanly instead of masking a conflict or overwriting third-party hooks.
+- **Clean init failure lifecycle:** Freed freshly loaded settings when startup discovery fails instead of leaving them allocated across `return FALSE`.
+
+### Changed
+- **Removal of unreachable settings retry path:** Removed the dead hook-installation retry block from `Wh_ModSettingsChanged` because Windhawk unloads the mod immediately whenever `Wh_ModInit` returns `FALSE`.
+
 ## [3.0.0-exp8] - 2026-11-22
 
 ### Added
 - **Multi-link chain discovery:** Resolved both intermediate and final browser comparison links across multi-anchor fallbacks (`firefox.exe`, `chrome.exe`, `msedge.exe`, `iexplore.exe`), isolating SSO pointer instructions cleanly even when the first link interleaves non-volatile frame register preloads.
-- **Automatic hook retry on settings save:** Retried site discovery and hook installation automatically when settings change if startup discovery failed.
+- **Settings-change hook retry (removed in `3.0.0-exp9`):** Attempted to retry hook installation on settings changes when startup discovery failed (determined unreachable under Windhawk's unload-on-false lifecycle and removed in `3.0.0-exp9`).
 
 ### Changed
 - **Zero-overhead fast path out of the box:** Cleared the legacy `iexplore.exe` entry from default `disabledApps` so natively detected browsers immediately take the pass-through stub path unless exclusions are explicitly added.
